@@ -82,7 +82,7 @@ Put the two server files from the folder you picked in `/root`, and your website
 /root/
 ├── Cargo.toml
 ├── main.rs
-└── www/
+└── /root/www/
     └── index.html
 ```
 
