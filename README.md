@@ -76,7 +76,7 @@ Each folder is a complete, standalone server. Pick **one**:
 
 ## Step 3 — Add your website files
 
-Put the two server files from the folder you picked in `/root`, and your website in `/root/www`:
+Put the two server files from the folder you picked in `/root` your index.html or files in `/root/www`:
 
 ```
 /root/
