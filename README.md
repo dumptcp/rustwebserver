@@ -91,18 +91,8 @@ Put the two server files from the folder you picked in `/root`, and your website
 ## Step 4 — Build
 
 ```bash
-cd /root
-```
-
-```bash
 cargo build --release
 ```
-
-The first build downloads and compiles everything the server needs and takes a few minutes. Later builds take seconds. It creates a `target/` folder and a `Cargo.lock` file next to your two files.
-
-If the build is killed (`signal: 9`), the server ran out of memory. In `Cargo.toml` change `lto = "fat"` to `lto = "thin"` and `codegen-units = 1` to `codegen-units = 4`, then build again.
-
----
 
 ## Step 5 — Open the firewall for Cloudflare
 
@@ -153,11 +143,6 @@ cargo clean
 - If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
 - `cache-assets-only` is the safest choice for most people.
 - Built for running behind Cloudflare: idle connections are kept for 960 seconds (longer than Cloudflare's 900 second reuse window, which avoids intermittent 520 errors) and there is no connection cap.
-
-## Differences from the Go version
-
-- File names with spaces or other percent-encoded characters (`/my%20file.html`) are served. The Go version returns 404 for them.
-- Compressed sizes for Zstd and Gzip differ by a few bytes because the libraries differ. Brotli output is byte-identical.
 
 ## License
 
