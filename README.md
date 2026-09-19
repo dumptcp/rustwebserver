@@ -46,8 +46,6 @@ Check it worked:
 cargo --version
 ```
 
-`build-essential` is required: the compression and allocator crates compile C code.
-
 ---
 
 ## Step 2 — Pick a version
@@ -142,6 +140,8 @@ cargo clean
 - Files are loaded into memory once at startup. After changing anything in `www`, restart the server. You only need to rebuild when `main.rs` or `Cargo.toml` changes.
 - If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
 - `cache-assets-only` is the safest choice for most people.
+
+---
 
 ## License
 
