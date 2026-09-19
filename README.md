@@ -142,7 +142,6 @@ cargo clean
 - Files are loaded into memory once at startup. After changing anything in `www`, restart the server. You only need to rebuild when `main.rs` or `Cargo.toml` changes.
 - If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
 - `cache-assets-only` is the safest choice for most people.
-- Built for running behind Cloudflare: idle connections are kept for 960 seconds (longer than Cloudflare's 900 second reuse window, which avoids intermittent 520 errors) and there is no connection cap.
 
 ## License
 
