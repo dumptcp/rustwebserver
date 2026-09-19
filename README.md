@@ -1,6 +1,6 @@
 # Rust Web Server
 
-A fast static file server written in Rust (Actix Web). Run a few commands, and your site is live.
+A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
 
 ---
 
@@ -26,7 +26,7 @@ sudo apt autoremove -y
 sudo reboot
 ```
 
-When the server is back you can continue.
+Reconnect to your server after it comes back up, then continue:
 
 ```bash
 sudo apt install -y build-essential curl
@@ -74,7 +74,7 @@ Each folder is a complete, standalone server. Pick **one**:
 
 ## Step 3 — Add your website files
 
-Put the two server files from the folder you picked in `/root` your index.html or files in `/root/www`:
+Put the `Cargo.toml` and `main.rs` from the folder you picked in `/root`, and your `index.html` and other site files in `/root/www`:
 
 ```
 /root/
@@ -92,6 +92,8 @@ Put the two server files from the folder you picked in `/root` your index.html o
 cargo build --release
 ```
 
+---
+
 ## Step 5 — Open the firewall for Cloudflare
 
 Load the included `cloudflare.conf`:
@@ -106,17 +108,21 @@ Verify it's active:
 sudo nft list ruleset
 ```
 
+---
+
 ## Step 6 — Run the server
 
 ```bash
 sudo ./target/release/rustwebserver
 ```
 
-Press `Ctrl+C` to stop it
+Press `Ctrl+C` to stop it.
+
+---
 
 ## Notes + Tips and Tricks
 
-Can help with gain more performance (run it in the same terminal, before starting the server):
+Can help gain more performance (run it before starting the server):
 
 ```bash
 ulimit -n 999999;ulimit -u unlimited;ulimit -e unlimited;ulimit -r unlimited
