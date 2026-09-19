@@ -1,0 +1,25 @@
+[package]
+name = "rustwebserver"
+version = "1.0.0"
+edition = "2021"
+
+# main.rs sits next to this file (no src/ folder), like main.go + go.mod
+[[bin]]
+name = "rustwebserver"
+path = "main.rs"
+
+[dependencies]
+actix-web = { version = "4", default-features = false, features = ["macros"] }
+bytes = "1"
+mimalloc = { version = "0.1", default-features = false }
+rlimit = "0.10"
+walkdir = "2"
+mime_guess = "2"
+percent-encoding = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
