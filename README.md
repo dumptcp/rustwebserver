@@ -2,8 +2,6 @@
 
 A fast static file server written in Rust (Actix Web). Run a few commands, and your site is live.
 
-This is the Rust port of [golangwebserver](https://github.com/dumptcp/golangwebserver). Each folder behaves the same as the Go folder with the same name: same routing, same headers, same ETags, same compression levels.
-
 ---
 
 ## Step 1 — Install Rust + update your server
@@ -123,30 +121,12 @@ sudo nft list ruleset
 ## Step 6 — Run the server
 
 ```bash
-sudo /root/target/release/rustwebserver
+sudo ./target/release/rustwebserver
 ```
 
-Press `Ctrl+C` to stop it. It finishes in-flight requests and exits.
-
-To use a different folder or port:
-
-```bash
-sudo ROOT=/var/www PORT=8080 /root/target/release/rustwebserver
-```
-
----
+Press `Ctrl+C` to stop it
 
 ## Notes + Tips and Tricks
-
-Keep it running after you close SSH, and still stop it whenever you want:
-
-```bash
-sudo apt install -y tmux
-tmux new -s web
-sudo /root/target/release/rustwebserver
-```
-
-Press `Ctrl+B` then `D` to leave it running. `tmux attach -t web` brings it back; `Ctrl+C` stops it.
 
 Can help with gain more performance (run it in the same terminal, before starting the server):
 
