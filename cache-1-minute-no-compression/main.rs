@@ -13,7 +13,7 @@ use actix_web::{
     body::{BodySize, MessageBody},
     http::{
         header::{
-            HeaderMap, HeaderValue, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_RANGE,
+            HeaderMap, HeaderValue, ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_RANGE,
             CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_NONE_MATCH, IF_RANGE, LOCATION,
             PERMISSIONS_POLICY, RANGE, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
             X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
@@ -28,32 +28,12 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 const HTML_CACHE_CONTROL: &str = "public, max-age=60, no-transform";
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
 
-// ---- Cloudflare-facing connection policy: never be the side that says no ----
-//
-// Cloudflare pools connections to the origin and reuses them for up to 900 s
-// after the last request. If we close an idle connection first, Cloudflare can
-// fire a request into a dead socket and the visitor gets an intermittent 520.
-// So our idle timeout must outlast theirs. (Go version: IdleTimeout 960 s.)
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
-// Only reaps sockets that connect and then never finish sending a request
-// head. Cloudflare always sends the full head at once, so real traffic never
-// hits this; it just stops dead sockets from leaking forever.
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
-// Per-worker cap. Actix defaults to 25k and stops accepting above that;
-// this makes it effectively unlimited.
 const MAX_CONNECTIONS: usize = 10_000_000;
-// Pending-accept queue size requested from the kernel.
 const BACKLOG: u32 = 65_535;
-// A file larger than this is handed to a connection in pieces of this size
-// instead of all at once. Actix copies what it is handed into the connection's
-// own buffer, and keeps that buffer for as long as the connection stays open.
-// Handed over in one piece, a 50 MB video would cost 50 MB of memory for every
-// connection that ever asked for it.
 const BODY_PIECE: usize = 64 * 1024;
 
-// This policy only allows resources from your own site. If your pages load
-// fonts, scripts, images, video or embeds from another site, add that site to
-// the matching line (see the README), or they will be blocked.
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; \
     base-uri 'self'; \
     form-action 'self'; \
@@ -74,8 +54,6 @@ const PERMISSIONS_POLICY_VALUE: &str = "accelerometer=(), autoplay=(), camera=()
     midi=(), payment=(), picture-in-picture=(self), publickey-credentials-get=(), \
     screen-wake-lock=(), sync-xhr=(), usb=(), xr-spatial-tracking=()";
 
-// Everything except these characters is percent-encoded in a redirect target.
-// It is the same set the Go version leaves alone.
 const REDIRECT_KEEP: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-')
@@ -91,8 +69,6 @@ const REDIRECT_KEEP: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'=')
     .remove(b'@');
 
-/// One cached file. `Bytes` is refcounted, so handing a body to a response
-/// is a pointer copy, never a memcpy.
 struct File {
     ctype: HeaderValue,
     cc: HeaderValue,
@@ -110,8 +86,6 @@ async fn main() -> std::io::Result<()> {
         process::exit(1);
     });
 
-    // Go raises the open-file soft limit to the hard limit at startup; Rust
-    // doesn't. Without this the server stalls at ~1000 connections.
     match rlimit::increase_nofile_limit(u64::MAX) {
         Ok(n) => println!("open file limit: {n}"),
         Err(e) => eprintln!("could not raise open file limit: {e}"),
@@ -134,12 +108,8 @@ async fn main() -> std::io::Result<()> {
     .client_request_timeout(REQUEST_HEAD_TIMEOUT)
     .max_connections(MAX_CONNECTIONS)
     .backlog(BACKLOG)
-    // Send what is written right away instead of letting the kernel hold the
-    // last bytes back while it waits for more (Nagle's algorithm). Go does
-    // this for every connection by default.
     .tcp_nodelay(true);
 
-    // Dual-stack like Go's ":80"; use IPv4 only if the host has IPv6 disabled.
     let host = if std::net::TcpListener::bind(("::", 0)).is_ok() {
         "::"
     } else {
@@ -154,8 +124,10 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
-    // The path arrives percent-encoded, so "/my%20file.html" would never match
-    // a file named "my file.html". Decode it first, like the Go version does.
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return refuse(req.method());
+    }
+
     let p = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
 
     if let Some(dir) = p.strip_suffix("index.html").filter(|d| d.ends_with('/')) {
@@ -174,8 +146,6 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
         files.get(key)
     };
     let Some(f) = f else {
-        // "/about" when the site has an "about" folder: send the browser to
-        // "/about/", which is where that folder's index.html is served.
         if !p.ends_with('/') && files.contains_key(&format!("{key}/index.html")) {
             let mut res = status(StatusCode::MOVED_PERMANENTLY, ASSET_CACHE_CONTROL);
             let location = redirect_target(&format!("{p}/")) + &query(&req);
@@ -187,10 +157,6 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
         return not_found(&files);
     };
 
-    // Conditional request: the browser (or Cloudflare) already holds this exact
-    // version, so answer 304 with no body instead of resending the file.
-    // Substring match like the Go version, which also accepts the W/"..." form
-    // proxies use and comma-separated lists.
     let not_modified = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -205,8 +171,6 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
 
     let mut body = f.body.clone();
 
-    // Byte ranges: what video and audio players use for seeking, and what
-    // Safari needs to play media at all.
     let range = req
         .headers()
         .get(RANGE)
@@ -215,8 +179,6 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
     let mut code = StatusCode::OK;
     let mut content_range = None;
     if let Some(range) = range {
-        // If-Range means "only send the part if the file is still this
-        // version"; when it is not, the whole file is sent instead.
         let current = req
             .headers()
             .get(IF_RANGE)
@@ -255,8 +217,6 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
     res
 }
 
-/// Adds the headers that tell the browser how to protect the visitor. They go
-/// on every page, including the 404 page.
 fn security_headers(h: &mut HeaderMap) {
     h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(
@@ -278,8 +238,26 @@ fn security_headers(h: &mut HeaderMap) {
     );
 }
 
-/// Answers 404. If the site has a 404.html in its top folder, that page is
-/// shown; otherwise the visitor gets a plain "Not Found".
+fn refuse(method: &Method) -> HttpResponse {
+    const OTHER_HTTP_METHODS: [Method; 7] = [
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::PATCH,
+        Method::OPTIONS,
+        Method::TRACE,
+        Method::CONNECT,
+    ];
+    if !OTHER_HTTP_METHODS.contains(method) {
+        return HttpResponse::build(StatusCode::NOT_IMPLEMENTED)
+            .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+            .body("Not Implemented");
+    }
+    let mut res = status(StatusCode::METHOD_NOT_ALLOWED, "no-store");
+    res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+    res
+}
+
 fn not_found(files: &Files) -> HttpResponse {
     let Some(f) = files.get("404.html") else {
         return status(StatusCode::NOT_FOUND, "no-store");
@@ -292,8 +270,6 @@ fn not_found(files: &Files) -> HttpResponse {
     res
 }
 
-/// A response with this status and these bytes as its body. A large body goes
-/// out piece by piece; see BODY_PIECE.
 fn response(code: StatusCode, body: Bytes) -> HttpResponse {
     if body.len() > BODY_PIECE {
         HttpResponse::build(code).body(Pieces(body))
@@ -302,9 +278,6 @@ fn response(code: StatusCode, body: Bytes) -> HttpResponse {
     }
 }
 
-/// A response body that gives out a file's bytes one piece at a time. Each
-/// piece is a view into the bytes already in memory, so nothing is copied
-/// here.
 struct Pieces(Bytes);
 
 impl MessageBody for Pieces {
@@ -326,7 +299,6 @@ impl MessageBody for Pieces {
     }
 }
 
-/// Same as Fiber's SendStatus: the reason phrase as a small text body.
 fn status(code: StatusCode, cache_control: &'static str) -> HttpResponse {
     let mut res = HttpResponse::build(code).body(code.canonical_reason().unwrap_or(""));
     let h = res.headers_mut();
@@ -338,19 +310,11 @@ fn status(code: StatusCode, cache_control: &'static str) -> HttpResponse {
     res
 }
 
-/// Turns a decoded directory path into a Location that can only ever point
-/// back at this site. Every unusual character is percent-encoded again, so a
-/// browser cannot reinterpret a `\` or a tab as part of the address, and the
-/// leading slashes are collapsed to one, so `//other.example/` stays a path on
-/// this site instead of becoming another host.
 fn redirect_target(dir: &str) -> String {
     let encoded = utf8_percent_encode(dir, REDIRECT_KEEP).to_string();
     format!("/{}", encoded.trim_start_matches('/'))
 }
 
-/// The request's query string with its `?`, so that a redirect keeps it:
-/// `/about?ref=x` goes to `/about/?ref=x`. It is passed on only when it is
-/// made of plain visible characters; anything else is left out.
 fn query(req: &HttpRequest) -> String {
     let q = req.query_string();
     if q.is_empty() || !q.bytes().all(|b| b.is_ascii_graphic()) {
@@ -360,18 +324,11 @@ fn query(req: &HttpRequest) -> String {
 }
 
 enum ByteRange {
-    /// Not a single valid byte range: send the whole file.
     Ignore,
-    /// Send bytes start..=end.
     Part(usize, usize),
-    /// Starts past the end of the file: answer 416.
     Unsatisfiable,
 }
 
-/// Reads a Range header holding one byte range: `bytes=0-99`, `bytes=100-` or
-/// `bytes=-500` (the last 500 bytes). Anything else, including a list of
-/// several ranges, is ignored, which HTTP allows: the client then simply
-/// receives the whole file.
 fn parse_range(header: &str, size: usize) -> ByteRange {
     const UNIT: &str = "bytes=";
     let unit_ok = header
@@ -390,7 +347,6 @@ fn parse_range(header: &str, size: usize) -> ByteRange {
     let (first, last) = (first.trim(), last.trim());
 
     if first.is_empty() {
-        // "-N": the last N bytes
         return match parse_pos(last) {
             None => ByteRange::Ignore,
             Some(0) => ByteRange::Unsatisfiable,
@@ -414,8 +370,6 @@ fn parse_range(header: &str, size: usize) -> ByteRange {
     ByteRange::Part(start, end)
 }
 
-/// Parses a plain run of digits. Numbers too large to be a position in any
-/// file are capped rather than rejected.
 fn parse_pos(s: &str) -> Option<usize> {
     if s.is_empty() {
         return None;
@@ -434,9 +388,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// FNV-1a 64: the same hash the Go version uses (hash/fnv), so both servers
-/// produce identical ETags for identical files. Stable across restarts; it
-/// only changes when the file's contents change.
 fn fnv1a(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -447,11 +398,9 @@ fn load(root: &Path) -> Files {
     let mut files = HashMap::new();
     let walker = walkdir::WalkDir::new(root)
         .into_iter()
-        // skip dotfiles and whole dot-directories (but never the root itself)
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
 
     for entry in walker.flatten() {
-        // symlinks are not followed, so this is "regular files only" like Go
         if !entry.file_type().is_file() {
             continue;
         }
@@ -494,8 +443,6 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     );
 }
 
-/// Content types for the extensions a website normally uses, the same list as
-/// the Go version. Anything not listed falls back to a built-in MIME table.
 fn content_type(rel: &str) -> String {
     let ext = Path::new(rel)
         .extension()
@@ -557,8 +504,6 @@ fn content_type(rel: &str) -> String {
         return fixed.to_owned();
     }
 
-    // Stand-in for Go's mime.TypeByExtension, including its habit of
-    // tagging text/* types with a utf-8 charset.
     match mime_guess::from_ext(&ext).first_raw() {
         Some(m) if m.starts_with("text/") => format!("{m}; charset=utf-8"),
         Some(m) => m.to_owned(),

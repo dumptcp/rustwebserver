@@ -3,7 +3,6 @@ name = "rustwebserver"
 version = "1.0.0"
 edition = "2021"
 
-# main.rs sits next to this file (no src/ folder), like main.go + go.mod
 [[bin]]
 name = "rustwebserver"
 path = "main.rs"
