@@ -33,7 +33,7 @@ use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 const HTML_CACHE_CONTROL: &str = "no-cache, must-revalidate";
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 const ZSTD_FAST: i32 = 3;
 const ZSTD_BEST: i32 = 19;
