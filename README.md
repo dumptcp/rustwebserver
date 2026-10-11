@@ -66,12 +66,13 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
 **Legend:**
-- **Compression ✅** = Files are pre-compressed into Zstd, Brotli, and Gzip, and every visitor gets the smallest version their browser can read. The site is online right away; the strongest compression finishes in the background shortly after.
-- **Compression ❌** = Files are served as-is. Larger downloads, but lower CPU usage at startup.
+- **Compression ✅** = Files are pre-compressed into Zstd, Brotli, and Gzip, and the server answers each request with the smallest version that request can accept. The site is online right away; the strongest compression finishes in the background shortly after.
+- **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
 - **Video and audio** = Every version supports seeking (byte ranges), which Safari on iPhone, iPad and Mac needs to play media at all.
 - **ETag** = The six `cache-*` folders send an `ETag` with every file and answer `304 Not Modified` (no body) when the browser or Cloudflare already has the current version. The two `no-cache` folders don't, on purpose.
+- **Cloudflare** = The server never tells Cloudflare how to treat your files. Whether Cloudflare compresses them, compresses them again, or passes them on unchanged is up to your own Cloudflare settings.
 
 ---
 

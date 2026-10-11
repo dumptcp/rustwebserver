@@ -25,8 +25,8 @@ use actix_web::{
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
-const HTML_CACHE_CONTROL: &str = "public, max-age=60, no-transform";
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+const HTML_CACHE_CONTROL: &str = "public, max-age=60";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);

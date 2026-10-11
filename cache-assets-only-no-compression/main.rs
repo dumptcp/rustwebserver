@@ -26,7 +26,7 @@ use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 const HTML_CACHE_CONTROL: &str = "no-cache, must-revalidate";
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
