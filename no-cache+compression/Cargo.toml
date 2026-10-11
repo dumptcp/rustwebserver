@@ -9,12 +9,12 @@ name = "rustwebserver"
 path = "main.rs"
 
 [dependencies]
-actix-web = { version = "4", default-features = false, features = ["macros"] }
+actix-web = { version = "4.13", default-features = false, features = ["macros"] }
 bytes = "1"
-mimalloc = { version = "0.1", default-features = false }
-rlimit = "0.10"
-zstd = "0.13"
-brotli = "8"
+arc-swap = "1"
+rlimit = "0.11"
+zstd = "0.14"
+brotli = "9"
 flate2 = "1"
 walkdir = "2"
 mime_guess = "2"

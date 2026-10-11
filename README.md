@@ -64,10 +64,11 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
 **Legend:**
-- **Compression ✅** = Files are pre-compressed into Zstd, Brotli, and Gzip at startup. Smaller downloads, faster page loads.
+- **Compression ✅** = Files are pre-compressed into Zstd, Brotli, and Gzip, and every visitor gets the smallest version their browser can read. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = Files are served as-is. Larger downloads, but lower CPU usage at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
+- **Video and audio** = Every version supports seeking (byte ranges), which Safari on iPhone, iPad and Mac needs to play media at all.
 - **ETag** = The six `cache-*` folders send an `ETag` with every file and answer `304 Not Modified` (no body) when the browser or Cloudflare already has the current version. The two `no-cache` folders don't, on purpose.
 
 ---
@@ -94,7 +95,22 @@ cargo build --release
 
 ---
 
-## Step 5 — Open the firewall for Cloudflare
+## Step 5 — Set up Cloudflare
+
+This server is made to sit behind Cloudflare. In your Cloudflare dashboard:
+
+1. **DNS:** point your domain at your server's IP address and leave the record **Proxied** (orange cloud).
+2. **SSL/TLS → Overview:** set the encryption mode to **Flexible**.
+
+Flexible is required. This server speaks plain HTTP, and Cloudflare adds HTTPS for your visitors. With **Full** or **Full (strict)**, Cloudflare tries to reach your server over HTTPS and your visitors get an error page.
+
+Recommended: also turn on **Always Use HTTPS** (SSL/TLS → Edge Certificates), so visitors who type `http://` are moved to `https://`.
+
+---
+
+## Step 6 — Open the firewall for Cloudflare
+
+> ⚠️ **Warning:** this firewall lets **only Cloudflare** reach your website. Use it only if your domain goes through Cloudflare (Step 5), or nobody will be able to open your site. SSH (port 22) stays open so you can still log in. Loading it replaces any firewall rules the server already has.
 
 Load the included `cloudflare.conf`:
 
@@ -108,9 +124,19 @@ Verify it's active:
 sudo nft list ruleset
 ```
 
+The rules are gone after a reboot unless you save them. To keep them:
+
+```bash
+sudo cp cloudflare.conf /etc/nftables.conf
+```
+
+```bash
+sudo systemctl enable nftables
+```
+
 ---
 
-## Step 6 — Run the server
+## Step 7 — Run the server
 
 ```bash
 sudo ./target/release/rustwebserver
@@ -144,8 +170,36 @@ cargo clean
 
 - This is a **static** server. It serves HTML, CSS, JS, images, and other files. It does **not** run PHP, Python, or any other server-side code.
 - Files are loaded into memory once at startup. After changing anything in `www`, restart the server. You only need to rebuild when `main.rs` or `Cargo.toml` changes.
+- `/about` and `/about/` both open `about/index.html`.
+- To show your own "page not found" page, put a `404.html` in the top of `www`. Inside it, start links to your CSS and images with `/` (for example `/style.css`), because the page is shown at many different addresses.
+- Pages can only load things from your own site unless you allow more. If you use Google Fonts, analytics, a CDN or embeds, see the next section.
 - If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
 - `cache-assets-only` is the safest choice for most people.
+
+---
+
+## Using fonts, scripts, or embeds from other sites
+
+To protect your visitors, the server tells browsers to load things only from your own site. Anything hosted somewhere else is blocked until you allow it.
+
+Open `main.rs`, find `CONTENT_SECURITY_POLICY_VALUE`, and add the other site to the matching line:
+
+| You want to use | Line to change | What to add |
+|---|---|---|
+| Google Fonts | `style-src` and `font-src` | `https://fonts.googleapis.com` to `style-src`, `https://fonts.gstatic.com` to `font-src` |
+| A script from a CDN | `script-src` | the CDN, for example `https://cdn.jsdelivr.net` |
+| Images or video hosted elsewhere | `img-src` or `media-src` | the site they come from, for example `https://images.example.com` |
+| A YouTube embed | add a new line | `frame-src https://www.youtube.com; ` |
+| Analytics or an API | `connect-src` (and `script-src` for its script) | the site, for example `https://api.example.com` |
+
+For example, with Google Fonts the two lines become:
+
+```
+    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+    font-src 'self' https://fonts.gstatic.com; \
+```
+
+Then rebuild with `cargo build --release` and restart the server.
 
 ---
 
