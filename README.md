@@ -2,6 +2,8 @@
 
 A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
 
+**Benchmark:** about 244,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
+
 ---
 
 ## Step 1 — Install Rust + update your server
@@ -201,6 +203,41 @@ For example, with Google Fonts the two lines become:
 ```
 
 Then rebuild with `cargo build --release` and restart the server.
+
+---
+
+## Benchmarks
+
+`cache-assets-only` with the server limited to 4 CPU cores:
+
+| Test | Requests per second | Half of responses within | 99% of responses within |
+|---|---|---|---|
+| Small file | 244,000 | 1.0 ms | 3.0 ms |
+| HTML page, compressed (33 KB sent as 5 KB) | 234,000 | 1.0 ms | 3.1 ms |
+| HTML page, uncompressed (33 KB) | 199,000 | 1.2 ms | 3.6 ms |
+| JavaScript file, compressed (269 KB sent as 26 KB) | 210,000 | 1.2 ms | 3.4 ms |
+| File the browser already has (`304 Not Modified`) | 249,000 | 1.0 ms | 2.9 ms |
+| Page not found (`404`) | 244,000 | 1.0 ms | 3.0 ms |
+| Image (120 KB) | 92,500 | 1.4 ms | 1.7 ms |
+| Video, 1 MB piece | 12,900 | 4.9 ms | 5.6 ms |
+| Video, whole 20 MB file | 620 | 51 ms | 72 ms |
+
+Requests per second with 1, 2 and 4 CPU cores:
+
+| CPU cores | Small file | HTML page, compressed |
+|---|---|---|
+| 1 | 86,200 | 83,200 |
+| 2 | 153,000 | 143,000 |
+| 4 | 244,000 | 234,000 |
+
+- **No failed requests** in over 22 million.
+- **Large files** went out at 11 to 13 GB per second.
+- **1,000 connections open at once:** 231,000 requests per second, 99% of them answered within 4.9 ms.
+- **Memory:** 28 MB with a 21 MB site loaded, and 29 MB with 1,000 connections open.
+- **Startup:** online in 0.2 seconds.
+- All eight versions are within 3% of each other.
+
+**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Windows 11, Rust 1.98), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator on the other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections. Your numbers will differ: a real server has a network in between, runs Linux, and often has fewer or slower cores.
 
 ---
 
