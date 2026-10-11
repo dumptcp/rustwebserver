@@ -2,7 +2,7 @@
 
 A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
 
-**Benchmark:** about 244,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
+**Benchmark:** about 248,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -213,32 +213,32 @@ Then rebuild with `cargo build --release` and restart the server.
 
 | Test | Requests per second | Half of responses within | 99% of responses within |
 |---|---|---|---|
-| Small file | 244,000 | 1.0 ms | 3.0 ms |
-| HTML page, compressed (33 KB sent as 5 KB) | 234,000 | 1.0 ms | 3.1 ms |
-| HTML page, uncompressed (33 KB) | 199,000 | 1.2 ms | 3.6 ms |
+| Small file | 248,000 | 1.0 ms | 2.9 ms |
+| HTML page, compressed (33 KB sent as 5 KB) | 238,000 | 1.0 ms | 3.0 ms |
+| HTML page, uncompressed (33 KB) | 201,000 | 1.2 ms | 3.6 ms |
 | JavaScript file, compressed (269 KB sent as 26 KB) | 210,000 | 1.2 ms | 3.4 ms |
-| File the browser already has (`304 Not Modified`) | 249,000 | 1.0 ms | 2.9 ms |
-| Page not found (`404`) | 244,000 | 1.0 ms | 3.0 ms |
-| Image (120 KB) | 92,500 | 1.4 ms | 1.7 ms |
+| File the browser already has (`304 Not Modified`) | 252,000 | 1.0 ms | 2.9 ms |
+| Page not found (`404`) | 246,000 | 1.0 ms | 3.0 ms |
+| Image (120 KB) | 91,800 | 1.4 ms | 1.7 ms |
 | Video, 1 MB piece | 12,900 | 4.9 ms | 5.6 ms |
-| Video, whole 20 MB file | 620 | 51 ms | 72 ms |
+| Video, whole 20 MB file | 620 | 51 ms | 69 ms |
 
 Requests per second with 1, 2 and 4 CPU cores:
 
 | CPU cores | Small file | HTML page, compressed |
 |---|---|---|
-| 1 | 86,200 | 83,200 |
-| 2 | 153,000 | 143,000 |
-| 4 | 244,000 | 234,000 |
+| 1 | 86,600 | 82,800 |
+| 2 | 152,000 | 145,000 |
+| 4 | 248,000 | 238,000 |
 
-- **No failed requests** in over 22 million.
+- **No failed requests** in over 48 million.
 - **Large files** went out at 11 to 13 GB per second.
-- **1,000 connections open at once:** 231,000 requests per second, 99% of them answered within 4.9 ms.
-- **Memory:** 28 MB with a 21 MB site loaded, and 29 MB with 1,000 connections open.
+- **1,000 connections open at once:** 229,000 requests per second, 99% of them answered within 5.0 ms.
+- **Memory:** 28 MB with a 21 MB site loaded, and 30 MB with 1,000 connections open.
 - **Startup:** online in 0.2 seconds.
-- All eight versions are within 3% of each other.
+- All eight versions are within 2% of each other.
 
-**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Windows 11, Rust 1.98), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator on the other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections. Your numbers will differ: a real server has a network in between, runs Linux, and often has fewer or slower cores.
+**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Windows 11, Rust 1.98), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator on the other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections, and the other seven versions ran a shorter set of the same tests once. Your numbers will differ: a real server has a network in between, runs Linux, and often has fewer or slower cores.
 
 ---
 
