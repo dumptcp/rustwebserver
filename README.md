@@ -66,7 +66,7 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
 **Legend:**
-- **Compression ✅** = Files are pre-compressed into Zstd, Brotli, and Gzip, and the server answers each request with the smallest version that request can accept. The site is online right away; the strongest compression finishes in the background shortly after.
+- **Compression ✅** = Files are pre-compressed into Brotli and Gzip, and the server answers each request with the smallest version that request can accept. Every browser and device can read at least one of them (Gzip works everywhere), and a request that accepts neither gets the file as-is. Cloudflare always asks your server for Brotli or Gzip, and can send Zstd to visitors from its side. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
@@ -237,6 +237,7 @@ Requests per second with 1, 2 and 4 CPU cores:
 - **Memory:** 28 MB with a 21 MB site loaded, and 30 MB with 1,000 connections open.
 - **Startup:** online in 0.2 seconds.
 - All eight versions are within 2% of each other.
+- **Re-tested after Zstd was removed:** the old and new version ran side by side on a Linux cloud machine with the same tests. Requests per second and memory did not change (the differences stayed within normal run-to-run variation), and the built server file got about 0.5 MB smaller (2.96 MB to 2.41 MB). The figures above are from the original run.
 
 **How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Windows 11, Rust 1.98), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator on the other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections, and the other seven versions ran a shorter set of the same tests once. Your numbers will differ: a real server has a network in between, runs Linux, and often has fewer or slower cores.
 

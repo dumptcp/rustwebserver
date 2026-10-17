@@ -34,8 +34,6 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
-const ZSTD_FAST: i32 = 3;
-const ZSTD_BEST: i32 = 19;
 const BROTLI_FAST: u32 = 6;
 const BROTLI_BEST: u32 = 11;
 const GZIP_FAST: u32 = 6;
@@ -46,9 +44,8 @@ const BROTLI_MAX_WINDOW: u32 = 22;
 
 const RETURN_MEMORY_EVERY: usize = 16 * 1024 * 1024;
 
-const ACCEPT_ZSTD: usize = 1;
-const ACCEPT_BR: usize = 2;
-const ACCEPT_GZIP: usize = 4;
+const ACCEPT_BR: usize = 1;
+const ACCEPT_GZIP: usize = 2;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -97,7 +94,7 @@ struct Variant {
     enc: Option<&'static str>,
 }
 
-type PickTable = [Variant; 8];
+type PickTable = [Variant; 4];
 
 struct File {
     ctype: HeaderValue,
@@ -271,9 +268,6 @@ fn accept_mask(req: &HttpRequest) -> usize {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let mut mask = 0;
-    if ae.contains("zstd") {
-        mask |= ACCEPT_ZSTD;
-    }
     if ae.contains("br") {
         mask |= ACCEPT_BR;
     }
@@ -496,13 +490,12 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     let etag = format!("\"{:016x}\"", fnv1a(&body));
     let body = Bytes::from(body);
 
-    let (mut zs, mut br, mut gz) = (None, None, None);
+    let (mut br, mut gz) = (None, None);
     if compressible(&ctype) {
-        zs = smaller(zstd::bulk::compress(&body, ZSTD_FAST).ok(), body.len());
         br = smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len());
         gz = smaller(gzip_of(&body, GZIP_FAST), body.len());
     }
-    let ranges = zs.is_none() && br.is_none() && gz.is_none();
+    let ranges = br.is_none() && gz.is_none();
 
     files.insert(
         rel,
@@ -511,7 +504,7 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
             cc: HeaderValue::from_static(ASSET_CACHE_CONTROL),
             etag: HeaderValue::from_str(&etag).expect("etag is ascii"),
-            pick: ArcSwap::from_pointee(pick_table(&body, zs, br, gz)),
+            pick: ArcSwap::from_pointee(pick_table(&body, br, gz)),
             ranges,
             body,
         },
@@ -534,16 +527,12 @@ fn recompress(files: &Files) {
                         smaller(new, current.body.len())
                             .or_else(|| current.enc.map(|_| current.body.clone()))
                     };
-                    let zs = keep(
-                        zstd::bulk::compress(&f.body, ZSTD_BEST).ok(),
-                        &old[ACCEPT_ZSTD],
-                    );
                     let br = keep(
                         brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len())),
                         &old[ACCEPT_BR],
                     );
                     let gz = keep(gzip_of(&f.body, GZIP_BEST), &old[ACCEPT_GZIP]);
-                    f.pick.store(Arc::new(pick_table(&f.body, zs, br, gz)));
+                    f.pick.store(Arc::new(pick_table(&f.body, br, gz)));
 
                     replaced += compressed_bytes(&old);
                     drop(old);
@@ -570,24 +559,20 @@ fn smaller(compressed: Option<Vec<u8>>, than: usize) -> Option<Bytes> {
 }
 
 fn compressed_bytes(table: &PickTable) -> usize {
-    [ACCEPT_ZSTD, ACCEPT_BR, ACCEPT_GZIP]
+    [ACCEPT_BR, ACCEPT_GZIP]
         .iter()
         .filter(|&&accept| table[accept].enc.is_some())
         .map(|&accept| table[accept].body.len())
         .sum()
 }
 
-fn pick_table(body: &Bytes, zs: Option<Bytes>, br: Option<Bytes>, gz: Option<Bytes>) -> PickTable {
+fn pick_table(body: &Bytes, br: Option<Bytes>, gz: Option<Bytes>) -> PickTable {
     std::array::from_fn(|mask| {
         let mut best = Variant {
             body: body.clone(),
             enc: None,
         };
-        for (bit, candidate, enc) in [
-            (ACCEPT_BR, &br, "br"),
-            (ACCEPT_ZSTD, &zs, "zstd"),
-            (ACCEPT_GZIP, &gz, "gzip"),
-        ] {
+        for (bit, candidate, enc) in [(ACCEPT_BR, &br, "br"), (ACCEPT_GZIP, &gz, "gzip")] {
             if let Some(c) = candidate.as_ref().filter(|_| mask & bit != 0) {
                 if c.len() < best.body.len() {
                     best = Variant {
