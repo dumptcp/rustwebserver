@@ -66,13 +66,16 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
 **Legend:**
-- **Compression ✅** = Files are pre-compressed into Brotli and Gzip, and the server answers each request with the smallest version that request can accept. Every browser and device can read at least one of them (Gzip works everywhere), and a request that accepts neither gets the file as-is. Cloudflare always asks your server for Brotli or Gzip, and can send Zstd to visitors from its side. The site is online right away; the strongest compression finishes in the background shortly after.
+- **Compression ✅** = Files are pre-compressed into Brotli and Gzip, and the server answers each request with the smallest version that request can accept. Every browser and device can read at least one of them (Gzip works everywhere), and a request that accepts neither gets the file as-is. Cloudflare always asks your server for Brotli or Gzip and passes it on to visitors unchanged. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
 - **Video and audio** = Every version supports seeking (byte ranges), which Safari on iPhone, iPad and Mac needs to play media at all.
 - **ETag** = The six `cache-*` folders send an `ETag` with every file and answer `304 Not Modified` (no body) when the browser or Cloudflare already has the current version. The two `no-cache` folders don't, on purpose.
-- **Cloudflare** = The server never tells Cloudflare how to treat your files. Whether Cloudflare compresses them, compresses them again, or passes them on unchanged is up to your own Cloudflare settings.
+- **Cloudflare** = Files are sent with `Cache-Control: no-transform` wherever Cloudflare changing them would only hurt, so Cloudflare passes them on exactly as the server sent them:
+  - **Compression ✅ folders:** every file. The server already compressed them, so Cloudflare keeps each file's `ETag` (304s keep working), doesn't compress them a second time, and doesn't insert its own scripts into your pages.
+  - **Compression ❌ folders:** only images, video, audio and fonts, which are already compressed. HTML, CSS, JS and other text are left open so Cloudflare can compress them for you.
+  - Because of this, Cloudflare's **JavaScript Detections** (Security → Bots) and automatic **Web Analytics** script are not added to pages in the Compression ✅ folders. In the Compression ❌ folders they are, and JavaScript Detections removes the `ETag` from your pages, so turn it off (along with **Bot Fight Mode**, which turns it on) if you want pages answered with `304`.
 
 ---
 
@@ -146,6 +149,16 @@ sudo ./target/release/rustwebserver
 ```
 
 Press `Ctrl+C` to stop it.
+
+### Settings
+
+Set these before the command above to change where the server looks and listens (for example `sudo ROOT=/srv/site PORT=8080 ./target/release/rustwebserver`):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `ROOT` | `/root/www` | The folder your site files are in |
+| `PORT` | `80` | The port the server listens on |
+| `HOST` | every address | The address it listens on. Use `HOST=127.0.0.1` when something on the same machine passes visitors to it, such as a Cloudflare Tunnel (`cloudflared`) or another web server, so the port can't be reached from outside |
 
 ---
 

@@ -32,7 +32,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
 
 const BROTLI_FAST: u32 = 6;
 const BROTLI_BEST: u32 = 11;
@@ -147,12 +147,14 @@ async fn main() -> std::io::Result<()> {
     .backlog(BACKLOG)
     .tcp_nodelay(true);
 
-    let host = if std::net::TcpListener::bind(("::", 0)).is_ok() {
-        "::"
-    } else {
-        "0.0.0.0"
-    };
-    let server = server.bind((host, port)).unwrap_or_else(|e| {
+    let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
+        if std::net::TcpListener::bind(("::", 0)).is_ok() {
+            "::".to_owned()
+        } else {
+            "0.0.0.0".to_owned()
+        }
+    });
+    let server = server.bind((host.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("listen on :{port}: {e}");
         process::exit(1);
     });

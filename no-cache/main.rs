@@ -69,6 +69,7 @@ const REDIRECT_KEEP: &AsciiSet = &NON_ALPHANUMERIC
 
 struct File {
     ctype: HeaderValue,
+    cc: HeaderValue,
     body: Bytes,
 }
 
@@ -106,12 +107,14 @@ async fn main() -> std::io::Result<()> {
     .backlog(BACKLOG)
     .tcp_nodelay(true);
 
-    let host = if std::net::TcpListener::bind(("::", 0)).is_ok() {
-        "::"
-    } else {
-        "0.0.0.0"
-    };
-    let server = server.bind((host, port)).unwrap_or_else(|e| {
+    let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
+        if std::net::TcpListener::bind(("::", 0)).is_ok() {
+            "::".to_owned()
+        } else {
+            "0.0.0.0".to_owned()
+        }
+    });
+    let server = server.bind((host.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("listen on :{port}: {e}");
         process::exit(1);
     });
@@ -191,7 +194,7 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
     if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
         h.insert(CONTENT_RANGE, v);
     }
-    h.insert(CACHE_CONTROL, HeaderValue::from_static(NO_CACHE_CONTROL));
+    h.insert(CACHE_CONTROL, f.cc.clone());
     security_headers(h);
     h.insert(CONTENT_TYPE, f.ctype.clone());
     res
@@ -392,6 +395,11 @@ fn load(root: &Path) -> Files {
 
 fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     let ctype = content_type(&rel);
+    let cc = if compressible(&ctype) {
+        NO_CACHE_CONTROL.to_owned()
+    } else {
+        format!("{NO_CACHE_CONTROL}, no-transform")
+    };
     let body = Bytes::from(body);
 
     files.insert(
@@ -399,6 +407,7 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
         File {
             ctype: HeaderValue::from_str(&ctype)
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            cc: HeaderValue::from_str(&cc).expect("cache-control is ascii"),
             body,
         },
     );
@@ -470,6 +479,22 @@ fn content_type(rel: &str) -> String {
         Some(m) => m.to_owned(),
         None => "application/octet-stream".to_owned(),
     }
+}
+
+fn compressible(ctype: &str) -> bool {
+    ctype.starts_with("text/")
+        || [
+            "javascript",
+            "json",
+            "svg",
+            "xml",
+            "x-icon",
+            "font/ttf",
+            "font/otf",
+            "application/wasm",
+        ]
+        .iter()
+        .any(|s| ctype.contains(s))
 }
 
 fn env_str(key: &str, fallback: &str) -> String {

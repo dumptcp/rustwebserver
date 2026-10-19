@@ -110,12 +110,14 @@ async fn main() -> std::io::Result<()> {
     .backlog(BACKLOG)
     .tcp_nodelay(true);
 
-    let host = if std::net::TcpListener::bind(("::", 0)).is_ok() {
-        "::"
-    } else {
-        "0.0.0.0"
-    };
-    let server = server.bind((host, port)).unwrap_or_else(|e| {
+    let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
+        if std::net::TcpListener::bind(("::", 0)).is_ok() {
+            "::".to_owned()
+        } else {
+            "0.0.0.0".to_owned()
+        }
+    });
+    let server = server.bind((host.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("listen on :{port}: {e}");
         process::exit(1);
     });
@@ -428,6 +430,11 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     } else {
         ASSET_CACHE_CONTROL
     };
+    let cc = if compressible(&ctype) {
+        cc.to_owned()
+    } else {
+        format!("{cc}, no-transform")
+    };
     let etag = format!("\"{:016x}\"", fnv1a(&body));
     let body = Bytes::from(body);
 
@@ -436,7 +443,7 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
         File {
             ctype: HeaderValue::from_str(&ctype)
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-            cc: HeaderValue::from_static(cc),
+            cc: HeaderValue::from_str(&cc).expect("cache-control is ascii"),
             etag: HeaderValue::from_str(&etag).expect("etag is ascii"),
             body,
         },
@@ -509,6 +516,22 @@ fn content_type(rel: &str) -> String {
         Some(m) => m.to_owned(),
         None => "application/octet-stream".to_owned(),
     }
+}
+
+fn compressible(ctype: &str) -> bool {
+    ctype.starts_with("text/")
+        || [
+            "javascript",
+            "json",
+            "svg",
+            "xml",
+            "x-icon",
+            "font/ttf",
+            "font/otf",
+            "application/wasm",
+        ]
+        .iter()
+        .any(|s| ctype.contains(s))
 }
 
 fn env_str(key: &str, fallback: &str) -> String {
