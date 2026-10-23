@@ -2,7 +2,7 @@
 
 A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
 
-**Benchmark:** about 248,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
+**Benchmark:** about 1,320,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -230,32 +230,32 @@ Then rebuild with `cargo build --release` and restart the server.
 
 | Test | Requests per second | Half of responses within | 99% of responses within |
 |---|---|---|---|
-| Small file | 248,000 | 1.0 ms | 2.9 ms |
-| HTML page, compressed (33 KB sent as 5 KB) | 238,000 | 1.0 ms | 3.0 ms |
-| HTML page, uncompressed (33 KB) | 201,000 | 1.2 ms | 3.6 ms |
-| JavaScript file, compressed (269 KB sent as 26 KB) | 210,000 | 1.2 ms | 3.4 ms |
-| File the browser already has (`304 Not Modified`) | 252,000 | 1.0 ms | 2.9 ms |
-| Page not found (`404`) | 246,000 | 1.0 ms | 3.0 ms |
-| Image (120 KB) | 91,800 | 1.4 ms | 1.7 ms |
-| Video, 1 MB piece | 12,900 | 4.9 ms | 5.6 ms |
-| Video, whole 20 MB file | 620 | 51 ms | 69 ms |
+| Small file (1 KB) | 1,320,000 | 0.18 ms | 0.26 ms |
+| HTML page, compressed (33 KB sent as 3 KB) | 1,190,000 | 0.20 ms | 0.29 ms |
+| HTML page, uncompressed (33 KB) | 735,000 | 0.33 ms | 0.42 ms |
+| JavaScript file, compressed (269 KB sent as 23 KB) | 829,000 | 0.29 ms | 0.41 ms |
+| File the browser already has (`304 Not Modified`) | 1,500,000 | 0.16 ms | 0.30 ms |
+| Page not found (`404`) | 1,310,000 | 0.18 ms | 0.27 ms |
+| Image (120 KB) | 289,000 | 0.40 ms | 0.54 ms |
+| Video, 1 MB piece | 36,800 | 1.6 ms | 1.9 ms |
+| Video, whole 20 MB file | 1,620 | 15 ms | 20 ms |
 
 Requests per second with 1, 2 and 4 CPU cores:
 
 | CPU cores | Small file | HTML page, compressed |
 |---|---|---|
-| 1 | 86,600 | 82,800 |
-| 2 | 152,000 | 145,000 |
-| 4 | 248,000 | 238,000 |
+| 1 | 370,000 | 336,000 |
+| 2 | 687,000 | 615,000 |
+| 4 | 1,310,000 | 1,180,000 |
 
-- **No failed requests** in over 48 million.
-- **Large files** went out at 11 to 13 GB per second.
-- **1,000 connections open at once:** 229,000 requests per second, 99% of them answered within 5.0 ms.
-- **Memory:** 28 MB with a 21 MB site loaded, and 30 MB with 1,000 connections open.
-- **Startup:** online in 0.2 seconds.
+- **No failed requests** in over 166 million.
+- **Large files** went out at 34 to 39 GB per second.
+- **1,000 connections open at once:** 1,190,000 requests per second, 99% of them answered within 1.0 ms.
+- **Memory:** 26 MB with a 20 MB site loaded, and 42 MB with 1,000 connections open.
+- **Startup:** online in 50 milliseconds.
 - All eight versions are within 2% of each other.
 
-**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Windows 11, Rust 1.98), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator on the other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections, and the other seven versions ran a shorter set of the same tests once. Your numbers will differ: a real server has a network in between, runs Linux, and often has fewer or slower cores.
+**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Ubuntu 26.04 in WSL2 on Windows 11, Rust 1.99.1), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator (wrk 4.1.0, 12 threads) on 12 other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections, and the other seven versions ran a shorter set of the same tests once. Your numbers will differ: a real server has a network in between and often has fewer or slower cores.
 
 ---
 
