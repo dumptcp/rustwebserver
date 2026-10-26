@@ -37,8 +37,6 @@ const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-trans
 
 const BROTLI_FAST: u32 = 6;
 const BROTLI_BEST: u32 = 11;
-const GZIP_FAST: u32 = 6;
-const GZIP_BEST: u32 = 9;
 
 const BROTLI_MIN_WINDOW: u32 = 16;
 const BROTLI_MAX_WINDOW: u32 = 22;
@@ -46,7 +44,6 @@ const BROTLI_MAX_WINDOW: u32 = 22;
 const RETURN_MEMORY_EVERY: usize = 16 * 1024 * 1024;
 
 const ACCEPT_BR: usize = 1;
-const ACCEPT_GZIP: usize = 2;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,7 +92,9 @@ struct Variant {
     enc: Option<&'static str>,
 }
 
-type PickTable = [Variant; 4];
+/// [original, Brotli]: Cloudflare always asks for `br, gzip` and decompresses Brotli
+/// itself for clients without it, so no gzip copy is kept.
+type PickTable = [Variant; 2];
 
 struct File {
     ctype: HeaderValue,
@@ -270,14 +269,36 @@ fn accept_mask(req: &HttpRequest) -> usize {
         .get(ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let mut mask = 0;
-    if ae.contains("br") {
-        mask |= ACCEPT_BR;
+    accept_mask_of(ae)
+}
+
+/// Whether the request accepts Brotli, per RFC 9110 §12.5.3: codings are
+/// case-insensitive, `;q=0` refuses one, and `*` stands for every coding not named.
+fn accept_mask_of(ae: &str) -> usize {
+    let (mut br, mut any) = (None, None);
+    for item in ae.split(',') {
+        let mut parts = item.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let refused = parts.any(|p| {
+            let p = p.trim();
+            // get() rather than [..2]: a non-ASCII byte must not panic (panic = abort)
+            p.get(..2).is_some_and(|k| k.eq_ignore_ascii_case("q="))
+                && p.get(2..).and_then(|v| v.trim().parse::<f32>().ok()).is_some_and(|q| q <= 0.0)
+        });
+        let slot = if coding.eq_ignore_ascii_case("br") {
+            &mut br
+        } else if coding == "*" {
+            &mut any
+        } else {
+            continue;
+        };
+        *slot = Some(!refused);
     }
-    if ae.contains("gzip") {
-        mask |= ACCEPT_GZIP;
+    if br.or(any).unwrap_or(false) {
+        ACCEPT_BR
+    } else {
+        0
     }
-    mask
 }
 
 fn security_headers(h: &mut HeaderMap) {
@@ -499,12 +520,10 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     let etag = format!("\"{:016x}\"", fnv1a(&body));
     let body = Bytes::from(body);
 
-    let (mut br, mut gz) = (None, None);
-    if compressible(&ctype) {
-        br = smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len());
-        gz = smaller(gzip_of(&body, GZIP_FAST), body.len());
-    }
-    let ranges = br.is_none() && gz.is_none();
+    let br = compressible(&ctype)
+        .then(|| smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len()))
+        .flatten();
+    let ranges = br.is_none();
 
     files.insert(
         rel,
@@ -513,7 +532,7 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
             cc: HeaderValue::from_static(cc),
             etag: HeaderValue::from_str(&etag).expect("etag is ascii"),
-            pick: ArcSwap::from_pointee(pick_table(&body, br, gz)),
+            pick: ArcSwap::from_pointee(pick_table(&body, br)),
             ranges,
             body,
         },
@@ -540,8 +559,7 @@ fn recompress(files: &Files) {
                         brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len())),
                         &old[ACCEPT_BR],
                     );
-                    let gz = keep(gzip_of(&f.body, GZIP_BEST), &old[ACCEPT_GZIP]);
-                    f.pick.store(Arc::new(pick_table(&f.body, br, gz)));
+                    f.pick.store(Arc::new(pick_table(&f.body, br)));
 
                     replaced += compressed_bytes(&old);
                     drop(old);
@@ -568,31 +586,22 @@ fn smaller(compressed: Option<Vec<u8>>, than: usize) -> Option<Bytes> {
 }
 
 fn compressed_bytes(table: &PickTable) -> usize {
-    [ACCEPT_BR, ACCEPT_GZIP]
-        .iter()
-        .filter(|&&accept| table[accept].enc.is_some())
-        .map(|&accept| table[accept].body.len())
-        .sum()
+    table[ACCEPT_BR].enc.map_or(0, |_| table[ACCEPT_BR].body.len())
 }
 
-fn pick_table(body: &Bytes, br: Option<Bytes>, gz: Option<Bytes>) -> PickTable {
-    std::array::from_fn(|mask| {
-        let mut best = Variant {
-            body: body.clone(),
-            enc: None,
-        };
-        for (bit, candidate, enc) in [(ACCEPT_BR, &br, "br"), (ACCEPT_GZIP, &gz, "gzip")] {
-            if let Some(c) = candidate.as_ref().filter(|_| mask & bit != 0) {
-                if c.len() < best.body.len() {
-                    best = Variant {
-                        body: c.clone(),
-                        enc: Some(enc),
-                    };
-                }
-            }
-        }
-        best
-    })
+fn pick_table(body: &Bytes, br: Option<Bytes>) -> PickTable {
+    let original = Variant {
+        body: body.clone(),
+        enc: None,
+    };
+    let brotli = match br {
+        Some(c) if c.len() < body.len() => Variant {
+            body: c,
+            enc: Some("br"),
+        },
+        _ => original.clone(),
+    };
+    [original, brotli]
 }
 
 fn content_type(rel: &str) -> String {
@@ -721,14 +730,6 @@ fn return_freed_memory_to_the_system() {
     }
 }
 
-fn gzip_of(b: &[u8], level: u32) -> Option<Vec<u8>> {
-    let mut w = flate2::write::GzEncoder::new(
-        Vec::with_capacity(b.len() / 2),
-        flate2::Compression::new(level),
-    );
-    w.write_all(b).ok()?;
-    w.finish().ok()
-}
 
 fn env_str(key: &str, fallback: &str) -> String {
     env::var(key)
