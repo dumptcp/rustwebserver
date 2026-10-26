@@ -1,8 +1,8 @@
-# Rust Web Server
+# Rust Web Server — no framework
 
-A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
+A fast static file server written in Rust, without a web framework. It is the same server as [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver), with the same eight versions and the same responses, rebuilt on a small purpose-built HTTP/1.1 engine ([tokio](https://tokio.rs) + [httparse](https://github.com/seanmonstar/httparse)) instead of Actix Web, so each request costs less CPU. Run a few commands, and your site is live.
 
-**Benchmark:** about 1,320,000 requests per second on 4 CPU cores, with no failed requests. See [Benchmarks](#benchmarks).
+**Benchmark:** about 90,000 requests per second from one CPU core of a 2-CPU DigitalOcean server, answering 4–8% more requests per CPU-second than the Actix Web version. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -42,7 +42,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 echo '. "$HOME/.cargo/env"' >> ~/.bashrc && source "$HOME/.cargo/env"
 ```
 
-Check it worked:
+Check it worked (this server needs Rust 1.82 or newer):
 
 ```bash
 cargo --version
@@ -65,8 +65,10 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-assets-only-no-compression/` | ❌ No | None (always fresh, revalidated with ETag) | 1 year | Fresh HTML, low CPU |
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
+All eight folders contain the same code. The only difference is the **settings** block at the top of each `main.rs`, which sets that version's compression, ETags and cache times.
+
 **Legend:**
-- **Compression ✅** = Files are pre-compressed into Brotli and Gzip, and the server answers each request with the smallest version that request can accept. Every browser and device can read at least one of them (Gzip works everywhere), and a request that accepts neither gets the file as-is. Cloudflare always asks your server for Brotli or Gzip and passes it on to visitors unchanged. The site is online right away; the strongest compression finishes in the background shortly after.
+- **Compression ✅** = Text files (HTML, CSS, JS, SVG, JSON, ...) are pre-compressed with Brotli at the strongest level, and the server sends that to every request that accepts Brotli; every other request gets the file as-is. Cloudflare always asks your server for Brotli and passes it on to visitors unchanged; for the few that can't read Brotli, Cloudflare sends the uncompressed file. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
@@ -149,14 +151,14 @@ sudo systemctl enable nftables
 ## Step 7 — Run the server
 
 ```bash
-sudo ./target/release/rustwebserver
+sudo ./target/release/rawstatic
 ```
 
-Press `Ctrl+C` to stop it.
+Press `Ctrl+C` to stop it. The server stops taking new visitors, lets downloads that are already running finish (for up to 30 seconds), then exits. `systemctl stop` and `kill` do the same.
 
 ### Settings
 
-Set these before the command above to change where the server looks and listens (for example `sudo ROOT=/srv/site PORT=8080 ./target/release/rustwebserver`):
+Set these before the command above to change where the server looks and listens (for example `sudo ROOT=/srv/site PORT=8080 ./target/release/rawstatic`):
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -168,7 +170,7 @@ Set these before the command above to change where the server looks and listens 
 
 ## Notes + Tips and Tricks
 
-Can help gain more performance (run it before starting the server):
+The server raises its own open-file limit at startup. These can still help (run them before starting the server):
 
 ```bash
 ulimit -n 999999;ulimit -u unlimited;ulimit -e unlimited;ulimit -r unlimited
@@ -191,6 +193,7 @@ cargo clean
 - This is a **static** server. It serves HTML, CSS, JS, images, and other files. It does **not** run PHP, Python, or any other server-side code.
 - It only answers requests that read a page or a file (`GET` and `HEAD`). A form or script that tries to send data to it (`POST`, `PUT`, `DELETE`, ...) gets `405 Method Not Allowed`.
 - Files are loaded into memory once at startup. After changing anything in `www`, restart the server. You only need to rebuild when `main.rs` or `Cargo.toml` changes.
+- Only one copy can run on a port. If an old copy is still running, a new one stops with `Address already in use`, so visitors are never split between an old and a new version of your site.
 - `/about` and `/about/` both open `about/index.html`.
 - To show your own "page not found" page, put a `404.html` in the top of `www`. Inside it, start links to your CSS and images with `/` (for example `/style.css`), because the page is shown at many different addresses.
 - Pages can only load things from your own site unless you allow more. If you use Google Fonts, analytics, a CDN or embeds, see the next section.
@@ -224,38 +227,37 @@ Then rebuild with `cargo build --release` and restart the server.
 
 ---
 
+## How it differs from the Actix Web version
+
+Normal traffic gets exactly the same responses: same headers, same compression, same ETags and 304s, same ranges, redirects and 404 page. Each of the eight folders was checked against the Actix Web version in the same folder of [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver): every file of a test site requested with Brotli, without `Accept-Encoding` and with gzip only, as `GET` and `HEAD` (150 requests per folder), gave byte-identical responses, and 79 of 85 raw-request tests matched. The 6 that differ are the ones below.
+
+What is different:
+
+- **Speed:** each request costs less CPU, because responses are prepared once at startup and there is no framework in between. Every CPU core has its own listener, so new connections are spread across cores by the kernel.
+- **Request bodies:** a `GET` or `HEAD` that carries a body gets `400 Bad Request`, and a `POST` (or other method) gets its `405` and the connection is closed, because the body is never read. The Actix version reads and discards bodies. Browsers and Cloudflare never send them.
+- **`Expect: 100-continue`** on a `GET`: answered directly, without the extra `100 Continue` line (allowed by HTTP/1.1 when there is no body).
+- **Pipelined requests after `Connection: close`:** the connection closes after that response, as HTTP/1.1 requires. Actix answers the next request too.
+
+---
+
 ## Benchmarks
 
-`cache-assets-only` with the server limited to 4 CPU cores:
+`cache-all` on a DigitalOcean server with 2 CPUs (AMD EPYC 9555P, Ubuntu 26.04, Rust 1.99.1), both versions built from source on the server (this repository and [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver)) and serving the same real site: one 14 KB page (sent as 3.3 KB with Brotli) and a 2 KB icon. Measured on October 26, 2026.
 
-| Test | Requests per second | Half of responses within | 99% of responses within |
-|---|---|---|---|
-| Small file (1 KB) | 1,320,000 | 0.18 ms | 0.26 ms |
-| HTML page, compressed (33 KB sent as 3 KB) | 1,190,000 | 0.20 ms | 0.29 ms |
-| HTML page, uncompressed (33 KB) | 735,000 | 0.33 ms | 0.42 ms |
-| JavaScript file, compressed (269 KB sent as 23 KB) | 829,000 | 0.29 ms | 0.41 ms |
-| File the browser already has (`304 Not Modified`) | 1,500,000 | 0.16 ms | 0.30 ms |
-| Page not found (`404`) | 1,310,000 | 0.18 ms | 0.27 ms |
-| Image (120 KB) | 289,000 | 0.40 ms | 0.54 ms |
-| Video, 1 MB piece | 36,800 | 1.6 ms | 1.9 ms |
-| Video, whole 20 MB file | 1,620 | 15 ms | 20 ms |
+| Test | Actix Web: requests per second | This server: requests per second | Actix Web: requests per CPU-second | This server: requests per CPU-second |
+|---|---|---|---|---|
+| Home page, Brotli (256 connections) | 89,319 | 90,162 | 99,194 | **105,714 (+7%)** |
+| `304 Not Modified` (256 connections) | 96,001 | 95,879 | 111,055 | **115,549 (+4%)** |
+| Both files in turn (256 connections) | 88,812 | 90,060 | 98,900 | **106,483 (+8%)** |
+| New connection every 10 requests (256 connections) | 57,230 | 57,304 | 70,985 | **75,445 (+6%)** |
+| Home page, Brotli (1,000 connections) | 85,661 | 85,956 | 96,056 | **101,734 (+6%)** |
 
-Requests per second with 1, 2 and 4 CPU cores:
+- **Requests per CPU-second** is how many requests one CPU core can answer with this server. It is the fair comparison here: with only 2 CPUs, the load generator had one of them and could not push either server to its limit, which is why the requests per second are so close.
+- **Latency:** half of all responses came back just as fast with both (1.3–1.4 ms at 256 connections, 5.8 ms at 1,000). The slowest 1% took a little longer with this server in three tests: 3.9 ms against 3.3 ms for `304`, 5.3 ms against 4.1 ms with new connections, and 14.5 ms against 12.1 ms with 1,000 connections.
+- **Memory:** 4.9 MB idle (Actix Web: 5.3 MB), 27.6 MB at most with 1,000 connections open (Actix Web: 23.2 MB).
+- **No failed requests** in 37.7 million.
 
-| CPU cores | Small file | HTML page, compressed |
-|---|---|---|
-| 1 | 370,000 | 336,000 |
-| 2 | 687,000 | 615,000 |
-| 4 | 1,310,000 | 1,180,000 |
-
-- **No failed requests** in over 166 million.
-- **Large files** went out at 34 to 39 GB per second.
-- **1,000 connections open at once:** 1,190,000 requests per second, 99% of them answered within 1.0 ms.
-- **Memory:** 26 MB with a 20 MB site loaded, and 42 MB with 1,000 connections open.
-- **Startup:** online in 50 milliseconds.
-- All eight versions are within 2% of each other.
-
-**How it was measured:** on one machine (Intel Core Ultra 7 270K Plus, Ubuntu 26.04 in WSL2 on Windows 11, Rust 1.99.1), with the server on 4 cores running one worker per core, as it does on its own on a 4-core Linux server, and the load generator (wrk 4.1.0, 12 threads) on 12 other cores. The two were connected directly, with no network in between. HTTP/1.1 with keep-alive over 256 connections (128 for the image, 64 and 32 for the two video tests), 5 seconds per test after a 1 second warm-up, averaged over two runs. The 1 and 2 core tests ran once, for 4 seconds, with 64 and 128 connections, and the other seven versions ran a shorter set of the same tests once. Your numbers will differ: a real server has a network in between and often has fewer or slower cores.
+**How it was measured:** the server on CPU 0 (one worker), the load generator (wrk 4.1.0, one thread) on CPU 1, over the loopback interface. HTTP/1.1 with keep-alive, requests sent the way Cloudflare sends them (`Accept-Encoding: br, gzip`), 15 seconds per test after a 3 second warm-up, 3 rounds alternating which version went first, averaged. Your numbers will differ: a real server has a network in between, and Cloudflare's cache answers most requests before they reach it.
 
 ---
 

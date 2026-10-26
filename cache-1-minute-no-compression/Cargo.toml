@@ -1,19 +1,24 @@
 [package]
-name = "rustwebserver"
-version = "1.0.0"
+name = "rawstatic"
+version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "rustwebserver"
+name = "rawstatic"
 path = "main.rs"
 
 [dependencies]
-actix-web = { version = "4.13", default-features = false, features = ["macros"] }
+arc-swap = "1"
+brotli = "9"
 bytes = "1"
-rlimit = "0.11"
-walkdir = "2"
+http = "1"
+httparse = "1"
+httpdate = "1"
 mime_guess = "2"
 percent-encoding = "2"
+rlimit = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "signal", "sync", "macros"] }
 
 [profile.release]
 opt-level = 3
