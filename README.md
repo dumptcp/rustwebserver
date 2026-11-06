@@ -65,6 +65,8 @@ Each folder is a complete, standalone server. Pick **one**:
 | `cache-assets-only-no-compression/` | ❌ No | None (always fresh, revalidated with ETag) | 1 year | Fresh HTML, low CPU |
 | `cache-1-minute-no-compression/` | ❌ No | 1 minute | 1 year | Frequent edits, low CPU |
 
+All eight folders contain the same code. The only difference is the **settings** block at the top of each `main.rs`, which sets that version's compression, ETags and cache times.
+
 **Legend:**
 - **Compression ✅** = Text files (HTML, CSS, JS, SVG, JSON, ...) are pre-compressed with Brotli at the strongest level, and the server sends that to every request that accepts Brotli; every other request gets the file as-is. Cloudflare always asks your server for Brotli and passes it on to visitors unchanged; for the few that can't read Brotli, Cloudflare sends the uncompressed file. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
@@ -170,7 +172,7 @@ sudo systemctl enable nftables
 sudo ./target/release/rustwebserver
 ```
 
-Press `Ctrl+C` to stop it.
+Press `Ctrl+C` to stop it. The server stops taking new visitors, lets downloads that are already running finish (for up to 30 seconds), then exits. `kill` does the same.
 
 To keep the server running after you close your terminal, start it inside `screen`:
 
@@ -198,7 +200,7 @@ Set these before the command above to change where the server looks and listens 
 
 ## Notes + Tips and Tricks
 
-Can help gain more performance (run it before starting the server):
+The server raises its own open-file limit at startup. These can still help (run them before starting the server):
 
 ```bash
 ulimit -n 999999;ulimit -u unlimited;ulimit -e unlimited;ulimit -r unlimited
@@ -221,10 +223,11 @@ cargo clean
 - This is a **static** server. It serves HTML, CSS, JS, images, and other files. It does **not** run PHP, Python, or any other server-side code.
 - It only answers requests that read a page or a file (`GET` and `HEAD`). A form or script that tries to send data to it (`POST`, `PUT`, `DELETE`, ...) gets `405 Method Not Allowed`.
 - Files are loaded into memory once at startup. After changing anything in `www`, restart the server (`Ctrl+C`, then start it again). You only need to rebuild when `main.rs` or `Cargo.toml` changes.
+- Only one copy can run on a port. If an old copy is still running, a new one stops with `Address already in use`, so visitors are never split between an old and a new version of your site.
 - `/about` and `/about/` both open `about/index.html`.
 - To show your own "page not found" page, put a `404.html` in the top of `www`. Inside it, start links to your CSS and images with `/` (for example `/style.css`), because the page is shown at many different addresses.
 - Pages can only load things from your own site unless you allow more. If you use Google Fonts, analytics, a CDN or embeds, see the next section.
-- If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
+- Images, CSS, JS and every other file that isn't a page are cached for a year in each `cache-*` version (pages too in `cache-all`). When you change one, give it a new name or link to it with `?v=2`, then purge Cloudflare's cache (Caching → Configuration → Purge Everything), or returning visitors keep the old copy.
 - `cache-assets-only` is the safest choice for most people.
 - Every response tells browsers to use HTTPS for a year on your domain **and all its subdomains** (`Strict-Transport-Security` with `includeSubDomains`). Make sure every subdomain works over HTTPS (with Cloudflare proxying them, they do). Otherwise, remove `; includeSubDomains` from `STRICT_TRANSPORT_SECURITY` in `main.rs`.
 - `cloudflare.conf` lists Cloudflare's addresses as published at [cloudflare.com/ips](https://www.cloudflare.com/ips/). They rarely change, but if Cloudflare adds one, update both lists in the file and load it again.

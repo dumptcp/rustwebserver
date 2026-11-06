@@ -1,3 +1,25 @@
+// ================================================================ settings
+// Version: cache-all (every file, HTML included, cached for a year).
+// This block is the only difference between the eight versions of this server; the same
+// folder of dumptcp/rawrustwebserver and dumptcp/golangwebserver uses the same settings.
+
+/// Keep a Brotli copy (strongest level) of every text file and send it to requests that
+/// accept Brotli. Cloudflare always asks for Brotli and decompresses it for visitors
+/// that cannot read it.
+const COMPRESSION: bool = true;
+/// Send an ETag with every file and answer 304 Not Modified while it still matches.
+const ETAGS: bool = true;
+/// Cache-Control for .html / .htm files, and for every other file.
+const HTML_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+/// Add `no-transform` only to file types that are already compressed (images, fonts,
+/// video, ...), so Cloudflare can still compress text files itself.
+const NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES: bool = false;
+/// Cache-Control for redirects, and for 404 / 405 / 416 responses.
+const REDIRECT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
+const ERROR_CACHE_CONTROL: &str = "no-store";
+
+// ================================================================ server
 use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
@@ -9,7 +31,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     thread,
@@ -32,8 +54,6 @@ use actix_web::{
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
 
 const BROTLI_FAST: u32 = 6;
 const BROTLI_BEST: u32 = 11;
@@ -96,6 +116,9 @@ struct Variant {
 /// itself for clients without it, so no gzip copy is kept.
 type PickTable = [Variant; 2];
 
+/// Header values and bodies that stay until the server exits are static, so handing
+/// them to a response copies a pointer instead of updating a reference count that
+/// every CPU core shares.
 struct File {
     ctype: HeaderValue,
     cc: HeaderValue,
@@ -145,7 +168,16 @@ impl Hasher for FxHasher {
 /// Keyed by path inside `www`. Every folder with an index.html is also listed under
 /// its own path ("" for the top, "docs/" for docs/index.html), sharing the same File,
 /// so `/` and `/docs/` are found without building a key per request.
-type Files = HashMap<String, std::sync::Arc<File>, BuildHasherDefault<FxHasher>>;
+type Files = HashMap<String, Arc<File>, BuildHasherDefault<FxHasher>>;
+
+/// The site, loaded once before the server starts. A plain static rather than
+/// `web::Data`, whose extractor clones an `Arc` on every request: one counter that
+/// every CPU core would update.
+static FILES: OnceLock<Files> = OnceLock::new();
+
+fn files() -> &'static Files {
+    FILES.get().expect("files are loaded before the server starts")
+}
 
 /// Whether `key` is a folder entry added by `load` rather than a file of its own.
 fn is_folder_key(key: &str) -> bool {
@@ -165,33 +197,30 @@ async fn main() -> std::io::Result<()> {
         Err(e) => eprintln!("could not raise open file limit: {e}"),
     }
 
-    let files = load(Path::new(&site_root));
-    if files.is_empty() {
+    let loaded = load(Path::new(&site_root));
+    if loaded.is_empty() {
         eprintln!("no files found under {site_root}");
         process::exit(1);
     }
-    let count = files.keys().filter(|k| !is_folder_key(k)).count();
+    let count = loaded.keys().filter(|k| !is_folder_key(k)).count();
     println!("loaded {count} files from {site_root}");
-    let files = web::Data::new(files);
+    let _ = FILES.set(loaded);
 
     return_large_blocks_when_freed();
     return_freed_memory_to_the_system();
-    let background = files.clone();
-    thread::spawn(move || {
-        recompress(&background);
-        return_freed_memory_to_the_system();
-    });
+    if COMPRESSION {
+        thread::spawn(|| {
+            recompress(files());
+            return_freed_memory_to_the_system();
+        });
+    }
 
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(files.clone())
-            .default_service(web::to(serve))
-    })
-    .keep_alive(KeepAlive::Timeout(KEEP_ALIVE))
-    .client_request_timeout(REQUEST_HEAD_TIMEOUT)
-    .max_connections(MAX_CONNECTIONS)
-    .backlog(BACKLOG)
-    .tcp_nodelay(true);
+    let server = HttpServer::new(|| App::new().default_service(web::to(serve)))
+        .keep_alive(KeepAlive::Timeout(KEEP_ALIVE))
+        .client_request_timeout(REQUEST_HEAD_TIMEOUT)
+        .max_connections(MAX_CONNECTIONS)
+        .backlog(BACKLOG)
+        .tcp_nodelay(true);
 
     let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
         if std::net::TcpListener::bind(("::", 0)).is_ok() {
@@ -208,15 +237,16 @@ async fn main() -> std::io::Result<()> {
     server.run().await
 }
 
-async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
+async fn serve(req: HttpRequest) -> HttpResponse {
     if req.method() != Method::GET && req.method() != Method::HEAD {
         return refuse(req.method());
     }
+    let files = files();
 
     let p = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
 
     if let Some(dir) = p.strip_suffix("index.html").filter(|d| d.ends_with('/')) {
-        let mut res = status(StatusCode::MOVED_PERMANENTLY, ASSET_CACHE_CONTROL);
+        let mut res = status(StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL);
         let location = redirect_target(dir) + &query(&req);
         if let Ok(loc) = HeaderValue::from_str(&location) {
             res.headers_mut().insert(LOCATION, loc);
@@ -227,26 +257,29 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
     let key = p.strip_prefix('/').unwrap_or(&p);
     let Some(f) = files.get(key) else {
         if !p.ends_with('/') && files.contains_key(&format!("{key}/")) {
-            let mut res = status(StatusCode::MOVED_PERMANENTLY, ASSET_CACHE_CONTROL);
+            let mut res = status(StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL);
             let location = redirect_target(&format!("{p}/")) + &query(&req);
             if let Ok(loc) = HeaderValue::from_str(&location) {
                 res.headers_mut().insert(LOCATION, loc);
             }
             return res;
         }
-        return not_found(&files, &req);
+        return not_found(files, &req);
     };
 
-    let not_modified = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .is_some_and(|inm| contains(inm.as_bytes(), f.etag.as_bytes()));
+    let not_modified = ETAGS
+        && req
+            .headers()
+            .get(IF_NONE_MATCH)
+            .is_some_and(|inm| contains(inm.as_bytes(), f.etag.as_bytes()));
     if not_modified {
         let mut res = HttpResponse::new(StatusCode::NOT_MODIFIED);
         let h = res.headers_mut();
         h.insert(ETAG, f.etag.clone());
         h.insert(CACHE_CONTROL, f.cc.clone());
-        h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        if COMPRESSION {
+            h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
         return res;
     }
 
@@ -263,7 +296,7 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
         let current = req
             .headers()
             .get(IF_RANGE)
-            .is_none_or(|ir| ir.is_empty() || ir.as_bytes() == f.etag.as_bytes());
+            .is_none_or(|ir| ir.is_empty() || (ETAGS && ir.as_bytes() == f.etag.as_bytes()));
         if current {
             match parse_range(range, body.len()) {
                 ByteRange::Part(start, end) => {
@@ -272,7 +305,7 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
                     code = StatusCode::PARTIAL_CONTENT;
                 }
                 ByteRange::Unsatisfiable => {
-                    let mut res = status(StatusCode::RANGE_NOT_SATISFIABLE, "no-store");
+                    let mut res = status(StatusCode::RANGE_NOT_SATISFIABLE, ERROR_CACHE_CONTROL);
                     let h = res.headers_mut();
                     h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                     if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", body.len())) {
@@ -293,9 +326,13 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
     if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
         h.insert(CONTENT_RANGE, v);
     }
-    h.insert(ETAG, f.etag.clone());
+    if ETAGS {
+        h.insert(ETAG, f.etag.clone());
+    }
     h.insert(CACHE_CONTROL, f.cc.clone());
-    h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    if COMPRESSION {
+        h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
     security_headers(h);
     h.insert(CONTENT_TYPE, f.ctype.clone());
     if let Some(enc) = enc {
@@ -305,6 +342,9 @@ async fn serve(files: web::Data<Files>, req: HttpRequest) -> HttpResponse {
 }
 
 fn accept_mask(req: &HttpRequest) -> usize {
+    if !COMPRESSION {
+        return 0;
+    }
     let ae = req
         .headers()
         .get(ACCEPT_ENCODING)
@@ -382,20 +422,22 @@ fn refuse(method: &Method) -> HttpResponse {
             .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
             .body("Not Implemented");
     }
-    let mut res = status(StatusCode::METHOD_NOT_ALLOWED, "no-store");
+    let mut res = status(StatusCode::METHOD_NOT_ALLOWED, ERROR_CACHE_CONTROL);
     res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
     res
 }
 
 fn not_found(files: &Files, req: &HttpRequest) -> HttpResponse {
     let Some(f) = files.get("404.html") else {
-        return status(StatusCode::NOT_FOUND, "no-store");
+        return status(StatusCode::NOT_FOUND, ERROR_CACHE_CONTROL);
     };
     let Variant { body, enc } = f.pick.load()[accept_mask(req)].clone();
     let mut res = response(StatusCode::NOT_FOUND, body);
     let h = res.headers_mut();
-    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    h.insert(CACHE_CONTROL, HeaderValue::from_static(ERROR_CACHE_CONTROL));
+    if COMPRESSION {
+        h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
     security_headers(h);
     h.insert(CONTENT_TYPE, f.ctype.clone());
     if let Some(enc) = enc {
@@ -551,11 +593,11 @@ fn load(root: &Path) -> Files {
             .join("/");
         add(&mut files, rel, body);
     }
-    let folders: Vec<(String, std::sync::Arc<File>)> = files
+    let folders: Vec<(String, Arc<File>)> = files
         .iter()
         .filter_map(|(k, f)| {
             let dir = k.strip_suffix("index.html")?;
-            (dir.is_empty() || dir.ends_with('/')).then(|| (dir.to_owned(), std::sync::Arc::clone(f)))
+            (dir.is_empty() || dir.ends_with('/')).then(|| (dir.to_owned(), Arc::clone(f)))
         })
         .collect();
     files.extend(folders);
@@ -564,26 +606,45 @@ fn load(root: &Path) -> Files {
 
 fn add(files: &mut Files, rel: String, body: Vec<u8>) {
     let ctype = content_type(&rel);
+    let lower = rel.to_ascii_lowercase();
+    let base = if lower.ends_with(".html") || lower.ends_with(".htm") {
+        HTML_CACHE_CONTROL
+    } else {
+        ASSET_CACHE_CONTROL
+    };
+    let cc = if NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES && !compressible(&ctype) {
+        format!("{base}, no-transform")
+    } else {
+        base.to_owned()
+    };
     let etag = format!("\"{:016x}\"", fnv1a(&body));
-    let body = Bytes::from(body);
+    let body = Bytes::from_static(Box::leak(body.into_boxed_slice()));
 
-    let br = compressible(&ctype)
+    let br = (COMPRESSION && compressible(&ctype))
         .then(|| smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len()))
         .flatten();
     let ranges = br.is_none();
 
     files.insert(
         rel,
-        std::sync::Arc::new(File {
-            ctype: HeaderValue::from_str(&ctype)
-                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-            cc: HeaderValue::from_static(ASSET_CACHE_CONTROL),
-            etag: HeaderValue::from_str(&etag).expect("etag is ascii"),
+        Arc::new(File {
+            ctype: static_value(ctype, "application/octet-stream"),
+            cc: static_value(cc, ASSET_CACHE_CONTROL),
+            etag: static_value(etag, "\"0\""),
             pick: ArcSwap::from_pointee(pick_table(&body, br)),
             ranges,
             body,
         }),
     );
+}
+
+/// A header value kept until the server exits, so cloning it never counts references.
+fn static_value(value: String, fallback: &'static str) -> HeaderValue {
+    if value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b)) {
+        HeaderValue::from_static(Box::leak(value.into_boxed_str()))
+    } else {
+        HeaderValue::from_static(fallback)
+    }
 }
 
 fn recompress(files: &Files) {
@@ -602,14 +663,12 @@ fn recompress(files: &Files) {
                 let mut replaced = 0;
                 while let Some(f) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let old = f.pick.load_full();
-                    let keep = |new: Option<Vec<u8>>, current: &Variant| {
-                        smaller(new, current.body.len())
-                            .or_else(|| current.enc.map(|_| current.body.clone()))
-                    };
-                    let br = keep(
-                        brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len())),
-                        &old[ACCEPT_BR],
-                    );
+                    let current = &old[ACCEPT_BR];
+                    // The strongest copy is kept until the server exits, so it is static.
+                    let br = brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len()))
+                        .filter(|c| !c.is_empty() && c.len() < current.body.len())
+                        .map(|c| Bytes::from_static(Box::leak(c.into_boxed_slice())))
+                        .or_else(|| current.enc.map(|_| current.body.clone()));
                     f.pick.store(Arc::new(pick_table(&f.body, br)));
 
                     replaced += compressed_bytes(&old);
@@ -672,9 +731,16 @@ fn content_type(rel: &str) -> String {
         "csv" => "text/csv; charset=utf-8",
         "md" => "text/markdown; charset=utf-8",
         "vtt" => "text/vtt; charset=utf-8",
+        "yaml" | "yml" => "text/x-yaml; charset=utf-8",
+        "toml" => "text/x-toml; charset=utf-8",
+        "ini" | "conf" | "cfg" | "log" => "text/plain; charset=utf-8",
+        "xslt" | "dtd" => "text/xml; charset=utf-8",
+        "vcf" => "text/x-vcard; charset=utf-8",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
         "zip" => "application/zip",
+        "tgz" => "application/x-compressed",
+        "rar" => "application/x-rar-compressed",
 
         "ico" => "image/x-icon",
         "png" => "image/png",
@@ -696,6 +762,7 @@ fn content_type(rel: &str) -> String {
         "mp4" => "video/mp4",
         "m4v" => "video/x-m4v",
         "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
         "webm" => "video/webm",
         "ogv" => "video/ogg",
         "3gp" => "video/3gpp",
@@ -710,6 +777,8 @@ fn content_type(rel: &str) -> String {
         "wav" => "audio/wav",
         "flac" => "audio/flac",
         "weba" => "audio/webm",
+        "mid" | "midi" => "audio/mid",
+        "aif" | "aiff" => "audio/aiff",
         _ => "",
     };
     if !fixed.is_empty() {
@@ -780,7 +849,6 @@ fn return_freed_memory_to_the_system() {
         }
     }
 }
-
 
 fn env_str(key: &str, fallback: &str) -> String {
     env::var(key)
