@@ -2,7 +2,7 @@
 
 A fast static file server written in Rust ([Actix Web](https://actix.rs)). Run a few commands, and your site is live.
 
-**Benchmark:** about 98,000 requests per second from one CPU core of a 2-CPU DigitalOcean server, answering 22–24% more requests per CPU-second than the Golang Web Server ([dumptcp/golangwebserver](https://github.com/dumptcp/golangwebserver)). The no-framework Rust webserver ([dumptcp/rawrustwebserver](https://github.com/dumptcp/rawrustwebserver)) answered 6–10% more than this server. See [Benchmarks](#benchmarks).
+**Benchmark:** about 108,000 requests per second from one CPU core of a 2-CPU DigitalOcean server, answering 25–29% more requests per CPU-second than the Golang Web Server ([dumptcp/golangwebserver](https://github.com/dumptcp/golangwebserver)). The no-framework Rust webserver ([dumptcp/rawrustwebserver](https://github.com/dumptcp/rawrustwebserver)) answered 4–10% more than this server. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -265,29 +265,29 @@ Then rebuild with `cargo build --release --locked` and restart the server.
 
 `cache-all` of the **no-framework Rust webserver** ([dumptcp/rawrustwebserver](https://github.com/dumptcp/rawrustwebserver)), **Actix Web** ([dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver)) and the **Golang Web Server** ([dumptcp/golangwebserver](https://github.com/dumptcp/golangwebserver), Fiber v3), on a DigitalOcean server with 2 CPUs (AMD EPYC 9555P, Ubuntu 26.04, Rust 1.99.1, Go 1.27.3). Measured in November 2026.
 
-This was run the same way you would run it by hand. In the `screen` session that runs the live site, the running server was stopped with Ctrl+C. Then the `cache-all` folder of each webserver was cleaned and built (`cargo clean && cargo build --release --locked` for the two Rust ones, `go clean -cache` and the build command from the Go README for Go) and started on port 80, serving a real site: a 10 KB home page (2.0 KB with Brotli) and a 3.9 KB CSS file (1.2 KB with Brotli). Each server was tested and then stopped with Ctrl+C. Each one was started 3 times, in rotating order, and the results were averaged.
+Each webserver's `cache-all` folder was cleaned and built (`cargo clean && cargo build --release --locked` for the two Rust ones, `go clean -cache` and the build command from the Go README for Go) and started on port 8080, serving a real site: a 10 KB home page (2.0 KB with Brotli) and a 3.9 KB CSS file (1.2 KB with Brotli). Each server was tested and then stopped with Ctrl+C. Each one was started 3 times, in rotating order, and the results were averaged.
 
 **Requests per CPU-second** (higher is better):
 
 | Test | No-framework Rust webserver | Actix Web | Golang Web Server |
 |---|---|---|---|
-| Home page, Brotli | **111,467** | 101,100 | 83,171 |
-| `304 Not Modified` | **121,222** | 114,778 | 92,786 |
-| CSS file, Brotli | **112,995** | 104,504 | 84,965 |
+| Home page, Brotli | **122,855** | 113,405 | 90,535 |
+| `304 Not Modified` | **131,815** | 126,437 | 97,971 |
+| CSS file, Brotli | **125,468** | 114,456 | 90,576 |
 
 **Requests per second:**
 
 | Test | No-framework Rust webserver | Actix Web | Golang Web Server |
 |---|---|---|---|
-| Home page, Brotli | 100,756 | 98,217 | 83,290 |
-| `304 Not Modified` | 112,173 | 111,659 | 92,873 |
-| CSS file, Brotli | 101,048 | 101,560 | 85,047 |
+| Home page, Brotli | 108,469 | 107,906 | 89,602 |
+| `304 Not Modified` | 119,911 | 121,291 | 97,085 |
+| CSS file, Brotli | 109,322 | 108,363 | 89,706 |
 
-- **Requests per CPU-second** is how many requests one CPU core can answer. It is the fair comparison here: with only 2 CPUs, the load generator had one of them and could not push the two Rust servers to their limit, which is why their requests per second are so close. The Golang Web Server used all of its CPU core, so its two numbers are the same.
-- **Result:** the no-framework Rust webserver answered 6–10% more requests per CPU-second than Actix Web and 31–34% more than the Golang Web Server. Actix Web answered 22–24% more than the Golang Web Server.
-- **Latency:** half of all responses came back in 1.1–1.3 ms with both Rust servers and 2.7–3.1 ms with Go. The slowest 1% took 2.1–2.2 ms (no-framework Rust), 2.3–2.6 ms (Actix Web) and 4.1–4.6 ms (Go).
-- **Memory:** idle, 4.8 MB (no-framework Rust), 5.2 MB (Actix Web) and 12.1 MB (Go). With 1,000 connections open, 26 MB, 22 MB and 34 MB.
-- **Clean build:** 21 seconds (no-framework Rust, 1.9 MB program), 47 seconds (Actix Web, 2.4 MB) and 28 seconds (Go, 10.8 MB).
+- **Requests per CPU-second** is how many requests one CPU core can answer. It is the fair comparison here: with only 2 CPUs, the load generator had one of them and could not push the two Rust servers to their limit, which is why their requests per second are so close. The Golang Web Server used all of its CPU core, so its two numbers are almost the same.
+- **Result:** the no-framework Rust webserver answered 4–10% more requests per CPU-second than Actix Web and 35–39% more than the Golang Web Server. Actix Web answered 25–29% more than the Golang Web Server.
+- **Latency:** half of all responses came back in 1.0–1.2 ms with both Rust servers and 2.6–2.8 ms with Go. The slowest 1% took 2.6–3.0 ms (no-framework Rust), 2.5–2.9 ms (Actix Web) and 4.0–4.4 ms (Go).
+- **Memory:** idle, 4.8 MB (no-framework Rust), 5.4 MB (Actix Web) and 12.0 MB (Go). With 1,000 connections open, 26 MB, 22 MB and 34 MB.
+- **Clean build:** 20 seconds (no-framework Rust, 1.9 MB program), 46 seconds (Actix Web, 2.4 MB) and 27 seconds (Go, 10.8 MB).
 - **No failed requests**, and every server stopped cleanly on Ctrl+C every time.
 
 **How it was measured:** the server pinned to CPU 0 (`taskset -c 0`), the load generator (wrk 4.1.0, one thread, 256 connections) on CPU 1, over the loopback interface. HTTP/1.1 with keep-alive, 7 seconds per test after a 2 second warm-up, with `Accept-Encoding: gzip, br`. Your numbers will differ: a real server has a network in between, and Cloudflare's cache answers most requests before they reach it.
