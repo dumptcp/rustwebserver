@@ -8,7 +8,7 @@ name = "rustwebserver"
 path = "main.rs"
 
 [dependencies]
-actix-web = { version = "4.13", default-features = false, features = ["macros"] }
+actix-web = { version = "4.19", default-features = false, features = ["macros"] }
 bytes = "1"
 arc-swap = "1"
 rlimit = "0.11"
