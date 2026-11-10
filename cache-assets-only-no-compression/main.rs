@@ -1,0 +1,858 @@
+// ================================================================ settings
+// Version: cache-assets-only-no-compression (HTML always revalidated (ETag), other files a year, no compression).
+// This block is the only difference between the eight versions of this server; the same
+// folder of dumptcp/rawrustwebserver and dumptcp/golangwebserver uses the same settings.
+
+/// Keep a Brotli copy (strongest level) of every text file and send it to requests that
+/// accept Brotli. Cloudflare always asks for Brotli and decompresses it for visitors
+/// that cannot read it.
+const COMPRESSION: bool = false;
+/// Send an ETag with every file and answer 304 Not Modified while it still matches.
+const ETAGS: bool = true;
+/// Cache-Control for .html / .htm files, and for every other file.
+const HTML_CACHE_CONTROL: &str = "no-cache, must-revalidate";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+/// Add `no-transform` only to file types that are already compressed (images, fonts,
+/// video, ...), so Cloudflare can still compress text files itself.
+const NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES: bool = true;
+/// Cache-Control for redirects, and for 404 / 405 / 416 responses.
+const REDIRECT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const ERROR_CACHE_CONTROL: &str = "no-store";
+
+// ================================================================ server
+use std::{
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
+    convert::Infallible,
+    env,
+    io::Write,
+    path::Path,
+    pin::Pin,
+    process,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
+    task::{Context, Poll},
+    thread,
+    time::{Duration, Instant},
+};
+
+use actix_web::{
+    body::{BodySize, MessageBody},
+    http::{
+        header::{
+            HeaderMap, HeaderValue, ACCEPT_ENCODING, ACCEPT_RANGES, ALLOW, CACHE_CONTROL,
+            CONTENT_ENCODING, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG,
+            IF_NONE_MATCH, IF_RANGE, LOCATION, PERMISSIONS_POLICY, RANGE, REFERRER_POLICY,
+            STRICT_TRANSPORT_SECURITY, VARY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+        },
+        KeepAlive, Method, StatusCode,
+    },
+    web, App, HttpRequest, HttpResponse, HttpServer,
+};
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+
+const BROTLI_FAST: u32 = 6;
+const BROTLI_BEST: u32 = 11;
+
+const BROTLI_MIN_WINDOW: u32 = 16;
+const BROTLI_MAX_WINDOW: u32 = 22;
+
+const RETURN_MEMORY_EVERY: usize = 16 * 1024 * 1024;
+
+const ACCEPT_BR: usize = 1;
+
+const KEEP_ALIVE: Duration = Duration::from_secs(960);
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONNECTIONS: usize = 10_000_000;
+const BACKLOG: u32 = 65_535;
+const BODY_PIECE: usize = 64 * 1024;
+
+const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; \
+    base-uri 'self'; \
+    form-action 'self'; \
+    frame-ancestors 'none'; \
+    img-src 'self' data: blob:; \
+    media-src 'self' data: blob:; \
+    style-src 'self' 'unsafe-inline'; \
+    script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+    worker-src 'self' blob:; \
+    font-src 'self'; \
+    connect-src 'self'; \
+    object-src 'none'; \
+    upgrade-insecure-requests";
+
+const PERMISSIONS_POLICY_VALUE: &str = "accelerometer=(), autoplay=(), camera=(), \
+    display-capture=(), encrypted-media=(), fullscreen=(self), \
+    geolocation=(), gyroscope=(), magnetometer=(), microphone=(), \
+    midi=(), payment=(), picture-in-picture=(self), publickey-credentials-get=(), \
+    screen-wake-lock=(), sync-xhr=(), usb=(), xr-spatial-tracking=()";
+
+const REDIRECT_KEEP: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b':')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b'@');
+
+#[derive(Clone)]
+struct Variant {
+    body: Bytes,
+    enc: Option<&'static str>,
+}
+
+/// [original, Brotli]: Cloudflare always asks for `br, gzip` and decompresses Brotli
+/// itself for clients without it, so no gzip copy is kept.
+type PickTable = [Variant; 2];
+
+/// Header values and bodies that stay until the server exits are static, so handing
+/// them to a response copies a pointer instead of updating a reference count that
+/// every CPU core shares.
+struct File {
+    ctype: HeaderValue,
+    cc: HeaderValue,
+    etag: HeaderValue,
+    body: Bytes,
+    pick: ArcSwap<PickTable>,
+    ranges: bool,
+}
+
+/// FxHash: a few multiplies per lookup instead of SipHash's rounds. Every key is a
+/// path from `www`, chosen by the site owner, so there is no hash flooding to defend
+/// against; requests only look keys up.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(last));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, b: u8) {
+        self.add(u64::from(b));
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Keyed by path inside `www`. Every folder with an index.html is also listed under
+/// its own path ("" for the top, "docs/" for docs/index.html), sharing the same File,
+/// so `/` and `/docs/` are found without building a key per request.
+type Files = HashMap<String, Arc<File>, BuildHasherDefault<FxHasher>>;
+
+/// The site, loaded once before the server starts. A plain static rather than
+/// `web::Data`, whose extractor clones an `Arc` on every request: one counter that
+/// every CPU core would update.
+static FILES: OnceLock<Files> = OnceLock::new();
+
+fn files() -> &'static Files {
+    FILES.get().expect("files are loaded before the server starts")
+}
+
+/// Whether `key` is a folder entry added by `load` rather than a file of its own.
+fn is_folder_key(key: &str) -> bool {
+    key.is_empty() || key.ends_with('/')
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let site_root = env_str("ROOT", "/root/www");
+    let port: u16 = env_str("PORT", "80").parse().unwrap_or_else(|e| {
+        eprintln!("bad PORT: {e}");
+        process::exit(1);
+    });
+
+    match rlimit::increase_nofile_limit(u64::MAX) {
+        Ok(n) => println!("open file limit: {n}"),
+        Err(e) => eprintln!("could not raise open file limit: {e}"),
+    }
+
+    let loaded = load(Path::new(&site_root));
+    if loaded.is_empty() {
+        eprintln!("no files found under {site_root}");
+        process::exit(1);
+    }
+    let count = loaded.keys().filter(|k| !is_folder_key(k)).count();
+    println!("loaded {count} files from {site_root}");
+    let _ = FILES.set(loaded);
+
+    return_large_blocks_when_freed();
+    return_freed_memory_to_the_system();
+    if COMPRESSION {
+        thread::spawn(|| {
+            recompress(files());
+            return_freed_memory_to_the_system();
+        });
+    }
+
+    let server = HttpServer::new(|| App::new().default_service(web::to(serve)))
+        .keep_alive(KeepAlive::Timeout(KEEP_ALIVE))
+        .client_request_timeout(REQUEST_HEAD_TIMEOUT)
+        .max_connections(MAX_CONNECTIONS)
+        .backlog(BACKLOG)
+        .tcp_nodelay(true);
+
+    let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
+        if std::net::TcpListener::bind(("::", 0)).is_ok() {
+            "::".to_owned()
+        } else {
+            "0.0.0.0".to_owned()
+        }
+    });
+    let server = server.bind((host.as_str(), port)).unwrap_or_else(|e| {
+        eprintln!("listen on :{port}: {e}");
+        process::exit(1);
+    });
+    println!("listening on :{port}");
+    server.run().await
+}
+
+async fn serve(req: HttpRequest) -> HttpResponse {
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return refuse(req.method());
+    }
+    let files = files();
+
+    let p = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
+
+    if let Some(dir) = p.strip_suffix("index.html").filter(|d| d.ends_with('/')) {
+        let mut res = status(StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL);
+        let location = redirect_target(dir) + &query(&req);
+        if let Ok(loc) = HeaderValue::from_str(&location) {
+            res.headers_mut().insert(LOCATION, loc);
+        }
+        return res;
+    }
+
+    let key = p.strip_prefix('/').unwrap_or(&p);
+    let Some(f) = files.get(key) else {
+        if !p.ends_with('/') && files.contains_key(&format!("{key}/")) {
+            let mut res = status(StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL);
+            let location = redirect_target(&format!("{p}/")) + &query(&req);
+            if let Ok(loc) = HeaderValue::from_str(&location) {
+                res.headers_mut().insert(LOCATION, loc);
+            }
+            return res;
+        }
+        return not_found(files, &req);
+    };
+
+    let not_modified = ETAGS
+        && req
+            .headers()
+            .get(IF_NONE_MATCH)
+            .is_some_and(|inm| contains(inm.as_bytes(), f.etag.as_bytes()));
+    if not_modified {
+        let mut res = HttpResponse::new(StatusCode::NOT_MODIFIED);
+        let h = res.headers_mut();
+        h.insert(ETAG, f.etag.clone());
+        h.insert(CACHE_CONTROL, f.cc.clone());
+        if COMPRESSION {
+            h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+        return res;
+    }
+
+    let Variant { mut body, enc } = f.pick.load()[accept_mask(&req)].clone();
+
+    let range = req
+        .headers()
+        .get(RANGE)
+        .filter(|_| f.ranges && req.method() == Method::GET)
+        .and_then(|v| v.to_str().ok());
+    let mut code = StatusCode::OK;
+    let mut content_range = None;
+    if let Some(range) = range {
+        let current = req
+            .headers()
+            .get(IF_RANGE)
+            .is_none_or(|ir| ir.is_empty() || (ETAGS && ir.as_bytes() == f.etag.as_bytes()));
+        if current {
+            match parse_range(range, body.len()) {
+                ByteRange::Part(start, end) => {
+                    content_range = Some(format!("bytes {start}-{end}/{}", body.len()));
+                    body = body.slice(start..=end);
+                    code = StatusCode::PARTIAL_CONTENT;
+                }
+                ByteRange::Unsatisfiable => {
+                    let mut res = status(StatusCode::RANGE_NOT_SATISFIABLE, ERROR_CACHE_CONTROL);
+                    let h = res.headers_mut();
+                    h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", body.len())) {
+                        h.insert(CONTENT_RANGE, v);
+                    }
+                    return res;
+                }
+                ByteRange::Ignore => {}
+            }
+        }
+    }
+
+    let mut res = response(code, body);
+    let h = res.headers_mut();
+    if f.ranges {
+        h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        h.insert(CONTENT_RANGE, v);
+    }
+    if ETAGS {
+        h.insert(ETAG, f.etag.clone());
+    }
+    h.insert(CACHE_CONTROL, f.cc.clone());
+    if COMPRESSION {
+        h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    security_headers(h);
+    h.insert(CONTENT_TYPE, f.ctype.clone());
+    if let Some(enc) = enc {
+        h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc));
+    }
+    res
+}
+
+fn accept_mask(req: &HttpRequest) -> usize {
+    if !COMPRESSION {
+        return 0;
+    }
+    let ae = req
+        .headers()
+        .get(ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // What Cloudflare sends on every request; skip parsing it.
+    if ae == "gzip, br" || ae == "br, gzip" {
+        return ACCEPT_BR;
+    }
+    accept_mask_of(ae)
+}
+
+/// Whether the request accepts Brotli, per RFC 9110 §12.5.3: codings are
+/// case-insensitive, `;q=0` refuses one, and `*` stands for every coding not named.
+fn accept_mask_of(ae: &str) -> usize {
+    let (mut br, mut any) = (None, None);
+    for item in ae.split(',') {
+        let mut parts = item.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let refused = parts.any(|p| {
+            let p = p.trim();
+            // get() rather than [..2]: a non-ASCII byte must not panic (panic = abort)
+            p.get(..2).is_some_and(|k| k.eq_ignore_ascii_case("q="))
+                && p.get(2..).and_then(|v| v.trim().parse::<f32>().ok()).is_some_and(|q| q <= 0.0)
+        });
+        let slot = if coding.eq_ignore_ascii_case("br") {
+            &mut br
+        } else if coding == "*" {
+            &mut any
+        } else {
+            continue;
+        };
+        *slot = Some(!refused);
+    }
+    if br.or(any).unwrap_or(false) {
+        ACCEPT_BR
+    } else {
+        0
+    }
+}
+
+fn security_headers(h: &mut HeaderMap) {
+    h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    h.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    h.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
+    );
+    h.insert(
+        PERMISSIONS_POLICY,
+        HeaderValue::from_static(PERMISSIONS_POLICY_VALUE),
+    );
+}
+
+fn refuse(method: &Method) -> HttpResponse {
+    const OTHER_HTTP_METHODS: [Method; 7] = [
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::PATCH,
+        Method::OPTIONS,
+        Method::TRACE,
+        Method::CONNECT,
+    ];
+    if !OTHER_HTTP_METHODS.contains(method) {
+        return HttpResponse::build(StatusCode::NOT_IMPLEMENTED)
+            .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+            .body("Not Implemented");
+    }
+    let mut res = status(StatusCode::METHOD_NOT_ALLOWED, ERROR_CACHE_CONTROL);
+    res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+    res
+}
+
+fn not_found(files: &Files, req: &HttpRequest) -> HttpResponse {
+    let Some(f) = files.get("404.html") else {
+        return status(StatusCode::NOT_FOUND, ERROR_CACHE_CONTROL);
+    };
+    let Variant { body, enc } = f.pick.load()[accept_mask(req)].clone();
+    let mut res = response(StatusCode::NOT_FOUND, body);
+    let h = res.headers_mut();
+    h.insert(CACHE_CONTROL, HeaderValue::from_static(ERROR_CACHE_CONTROL));
+    if COMPRESSION {
+        h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    security_headers(h);
+    h.insert(CONTENT_TYPE, f.ctype.clone());
+    if let Some(enc) = enc {
+        h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc));
+    }
+    res
+}
+
+fn response(code: StatusCode, body: Bytes) -> HttpResponse {
+    if body.len() > BODY_PIECE {
+        HttpResponse::build(code).body(Pieces(body))
+    } else {
+        HttpResponse::build(code).body(body)
+    }
+}
+
+struct Pieces(Bytes);
+
+impl MessageBody for Pieces {
+    type Error = Infallible;
+
+    fn size(&self) -> BodySize {
+        BodySize::Sized(self.0.len() as u64)
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Infallible>>> {
+        if self.0.is_empty() {
+            return Poll::Ready(None);
+        }
+        let n = self.0.len().min(BODY_PIECE);
+        Poll::Ready(Some(Ok(self.0.split_to(n))))
+    }
+}
+
+fn status(code: StatusCode, cache_control: &'static str) -> HttpResponse {
+    let mut res = HttpResponse::build(code).body(code.canonical_reason().unwrap_or(""));
+    let h = res.headers_mut();
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    h.insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    res
+}
+
+fn redirect_target(dir: &str) -> String {
+    let encoded = utf8_percent_encode(dir, REDIRECT_KEEP).to_string();
+    format!("/{}", encoded.trim_start_matches('/'))
+}
+
+fn query(req: &HttpRequest) -> String {
+    let q = req.query_string();
+    if q.is_empty() || !q.bytes().all(|b| b.is_ascii_graphic()) {
+        return String::new();
+    }
+    format!("?{q}")
+}
+
+enum ByteRange {
+    Ignore,
+    Part(usize, usize),
+    Unsatisfiable,
+}
+
+fn parse_range(header: &str, size: usize) -> ByteRange {
+    const UNIT: &str = "bytes=";
+    let unit_ok = header
+        .get(..UNIT.len())
+        .is_some_and(|u| u.eq_ignore_ascii_case(UNIT));
+    if size == 0 || !unit_ok {
+        return ByteRange::Ignore;
+    }
+    let spec = header[UNIT.len()..].trim();
+    if spec.contains(',') {
+        return ByteRange::Ignore;
+    }
+    let Some((first, last)) = spec.split_once('-') else {
+        return ByteRange::Ignore;
+    };
+    let (first, last) = (first.trim(), last.trim());
+
+    if first.is_empty() {
+        return match parse_pos(last) {
+            None => ByteRange::Ignore,
+            Some(0) => ByteRange::Unsatisfiable,
+            Some(n) => ByteRange::Part(size - n.min(size), size - 1),
+        };
+    }
+
+    let Some(start) = parse_pos(first) else {
+        return ByteRange::Ignore;
+    };
+    let mut end = size - 1;
+    if !last.is_empty() {
+        match parse_pos(last) {
+            Some(e) if e >= start => end = end.min(e),
+            _ => return ByteRange::Ignore,
+        }
+    }
+    if start >= size {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Part(start, end)
+}
+
+fn parse_pos(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for d in s.bytes() {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        n = n.saturating_mul(10).saturating_add(usize::from(d - b'0'));
+    }
+    Some(n)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn fnv1a(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn load(root: &Path) -> Files {
+    let mut files = Files::default();
+    let walker = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(body) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        add(&mut files, rel, body);
+    }
+    let folders: Vec<(String, Arc<File>)> = files
+        .iter()
+        .filter_map(|(k, f)| {
+            let dir = k.strip_suffix("index.html")?;
+            (dir.is_empty() || dir.ends_with('/')).then(|| (dir.to_owned(), Arc::clone(f)))
+        })
+        .collect();
+    files.extend(folders);
+    files
+}
+
+fn add(files: &mut Files, rel: String, body: Vec<u8>) {
+    let ctype = content_type(&rel);
+    let lower = rel.to_ascii_lowercase();
+    let base = if lower.ends_with(".html") || lower.ends_with(".htm") {
+        HTML_CACHE_CONTROL
+    } else {
+        ASSET_CACHE_CONTROL
+    };
+    let cc = if NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES && !compressible(&ctype) {
+        format!("{base}, no-transform")
+    } else {
+        base.to_owned()
+    };
+    let etag = format!("\"{:016x}\"", fnv1a(&body));
+    let body = Bytes::from_static(Box::leak(body.into_boxed_slice()));
+
+    let br = (COMPRESSION && compressible(&ctype))
+        .then(|| smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len()))
+        .flatten();
+    let ranges = br.is_none();
+
+    files.insert(
+        rel,
+        Arc::new(File {
+            ctype: static_value(ctype, "application/octet-stream"),
+            cc: static_value(cc, ASSET_CACHE_CONTROL),
+            etag: static_value(etag, "\"0\""),
+            pick: ArcSwap::from_pointee(pick_table(&body, br)),
+            ranges,
+            body,
+        }),
+    );
+}
+
+/// A header value kept until the server exits, so cloning it never counts references.
+fn static_value(value: String, fallback: &'static str) -> HeaderValue {
+    if value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b)) {
+        HeaderValue::from_static(Box::leak(value.into_boxed_str()))
+    } else {
+        HeaderValue::from_static(fallback)
+    }
+}
+
+fn recompress(files: &Files) {
+    let start = Instant::now();
+    let todo: Vec<&File> = files
+        .iter()
+        .filter(|(k, f)| !is_folder_key(k) && !f.ranges)
+        .map(|(_, f)| &**f)
+        .collect();
+    let next = AtomicUsize::new(0);
+    let workers = thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
+
+    thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                let mut replaced = 0;
+                while let Some(f) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let old = f.pick.load_full();
+                    let current = &old[ACCEPT_BR];
+                    // The strongest copy is kept until the server exits, so it is static.
+                    let br = brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len()))
+                        .filter(|c| !c.is_empty() && c.len() < current.body.len())
+                        .map(|c| Bytes::from_static(Box::leak(c.into_boxed_slice())))
+                        .or_else(|| current.enc.map(|_| current.body.clone()));
+                    f.pick.store(Arc::new(pick_table(&f.body, br)));
+
+                    replaced += compressed_bytes(&old);
+                    drop(old);
+                    if replaced >= RETURN_MEMORY_EVERY {
+                        replaced = 0;
+                        return_freed_memory_to_the_system();
+                    }
+                }
+            });
+        }
+    });
+    let _ = writeln!(
+        std::io::stdout(),
+        "recompressed {} files at the strongest levels in {:.1?}",
+        todo.len(),
+        start.elapsed()
+    );
+}
+
+fn smaller(compressed: Option<Vec<u8>>, than: usize) -> Option<Bytes> {
+    compressed
+        .filter(|c| !c.is_empty() && c.len() < than)
+        .map(|c| Bytes::from(c.into_boxed_slice()))
+}
+
+fn compressed_bytes(table: &PickTable) -> usize {
+    table[ACCEPT_BR].enc.map_or(0, |_| table[ACCEPT_BR].body.len())
+}
+
+fn pick_table(body: &Bytes, br: Option<Bytes>) -> PickTable {
+    let original = Variant {
+        body: body.clone(),
+        enc: None,
+    };
+    let brotli = match br {
+        Some(c) if c.len() < body.len() => Variant {
+            body: c,
+            enc: Some("br"),
+        },
+        _ => original.clone(),
+    };
+    [original, brotli]
+}
+
+fn content_type(rel: &str) -> String {
+    let ext = Path::new(rel)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let fixed = match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "webmanifest" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "vtt" => "text/vtt; charset=utf-8",
+        "yaml" | "yml" => "text/x-yaml; charset=utf-8",
+        "toml" => "text/x-toml; charset=utf-8",
+        "ini" | "conf" | "cfg" | "log" => "text/plain; charset=utf-8",
+        "xslt" | "dtd" => "text/xml; charset=utf-8",
+        "vcf" => "text/x-vcard; charset=utf-8",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tgz" => "application/x-compressed",
+        "rar" => "application/x-rar-compressed",
+
+        "ico" => "image/x-icon",
+        "png" => "image/png",
+        "apng" => "image/apng",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "jxl" => "image/jxl",
+        "heic" => "image/heic",
+
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+
+        "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "3gp" => "video/3gpp",
+        "ts" => "video/mp2t",
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "mpd" => "application/dash+xml",
+
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "weba" => "audio/webm",
+        "mid" | "midi" => "audio/mid",
+        "aif" | "aiff" => "audio/aiff",
+        _ => "",
+    };
+    if !fixed.is_empty() {
+        return fixed.to_owned();
+    }
+
+    match mime_guess::from_ext(&ext).first_raw() {
+        Some(m) if m.starts_with("text/") => format!("{m}; charset=utf-8"),
+        Some(m) => m.to_owned(),
+        None => "application/octet-stream".to_owned(),
+    }
+}
+
+fn compressible(ctype: &str) -> bool {
+    ctype.starts_with("text/")
+        || [
+            "javascript",
+            "json",
+            "svg",
+            "xml",
+            "x-icon",
+            "font/ttf",
+            "font/otf",
+            "application/wasm",
+        ]
+        .iter()
+        .any(|s| ctype.contains(s))
+}
+
+fn brotli_of(b: &[u8], quality: u32, window: u32) -> Option<Vec<u8>> {
+    let mut w =
+        brotli::CompressorWriter::new(Vec::with_capacity(b.len() / 2), 4096, quality, window);
+    w.write_all(b).ok()?;
+    Some(w.into_inner())
+}
+
+fn brotli_window(size: usize) -> u32 {
+    let mut lgwin = BROTLI_MIN_WINDOW;
+    while lgwin < BROTLI_MAX_WINDOW && (1usize << lgwin) - 16 < size {
+        lgwin += 1;
+    }
+    lgwin
+}
+
+fn return_large_blocks_when_freed() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        const M_MMAP_THRESHOLD: i32 = -3;
+        unsafe {
+            mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+            mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        }
+    }
+}
+
+fn return_freed_memory_to_the_system() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+fn env_str(key: &str, fallback: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
