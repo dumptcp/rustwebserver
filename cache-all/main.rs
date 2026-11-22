@@ -1,6 +1,5 @@
 // ================================================================ settings
-// Version: cache-all (hashed files under /assets/ cached for a year, every other file
-// revalidated with its ETag).
+// Version: cache-all (every file cached for a year).
 // This block is the only difference between the eight versions of this server; the same
 // folder of dumptcp/rawrustwebserver and dumptcp/golangwebserver uses the same settings.
 
@@ -13,7 +12,7 @@ const ETAGS: bool = true;
 /// Cache-Control for files under /assets/ (give them a content hash in their name), and
 /// for every other file: HTML, favicon, JSON, robots.txt, ...
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
-const OTHER_CACHE_CONTROL: &str = "no-cache, no-transform";
+const OTHER_CACHE_CONTROL: &str = "public, max-age=31536000, immutable, no-transform";
 /// Add `no-transform` only to file types that are already compressed (images, fonts,
 /// video, ...), so Cloudflare can still compress text files itself.
 const NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES: bool = false;
@@ -24,11 +23,11 @@ const ERROR_CACHE_CONTROL: &str = "no-store";
 // ================================================================ server
 use std::{
     collections::HashMap,
-    hash::{BuildHasherDefault, Hasher},
     convert::Infallible,
     env,
-    io::Write,
-    path::Path,
+    hash::{BuildHasherDefault, Hasher},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     pin::Pin,
     process,
     sync::{
@@ -41,7 +40,7 @@ use std::{
 };
 
 use actix_web::{
-    body::{BodySize, MessageBody},
+    body::{BodySize, MessageBody, SizedStream},
     http::{
         header::{
             HeaderMap, HeaderValue, ACCEPT_ENCODING, ACCEPT_RANGES, ALLOW, CACHE_CONTROL,
@@ -56,6 +55,8 @@ use actix_web::{
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 const BROTLI_FAST: u32 = 6;
 const BROTLI_BEST: u32 = 11;
@@ -67,10 +68,12 @@ const RETURN_MEMORY_EVERY: usize = 16 * 1024 * 1024;
 
 const ACCEPT_BR: usize = 1;
 
-const KEEP_ALIVE: Duration = Duration::from_secs(960);
+const KEEP_ALIVE: Duration = Duration::from_secs(75);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_CONNECTIONS: usize = 10_000_000;
-const BACKLOG: u32 = 65_535;
+const CLIENT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+const DEFAULT_MAX_IN_MEMORY: usize = 2 * 1024 * 1024;
+const BACKLOG: u32 = 1024;
 const BODY_PIECE: usize = 64 * 1024;
 
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; \
@@ -117,16 +120,26 @@ struct Variant {
 /// itself for clients without it, so no gzip copy is kept.
 type PickTable = [Variant; 2];
 
-/// Header values and bodies that stay until the server exits are static, so handing
-/// them to a response copies a pointer instead of updating a reference count that
-/// every CPU core shares.
+/// In-memory bodies use `Bytes` (shared, not leaked). Files larger than
+/// `MAX_IN_MEMORY` are served from disk and keep only path, size and ETag here.
 struct File {
     ctype: HeaderValue,
     cc: HeaderValue,
     etag: HeaderValue,
     body: Bytes,
+    disk_path: Option<PathBuf>,
+    size: usize,
     pick: ArcSwap<PickTable>,
     ranges: bool,
+}
+
+enum FileSource {
+    Memory(Vec<u8>),
+    Disk {
+        path: PathBuf,
+        size: usize,
+        hash: u64,
+    },
 }
 
 /// FxHash: a few multiplies per lookup instead of SipHash's rounds. Every key is a
@@ -177,7 +190,9 @@ type Files = HashMap<String, Arc<File>, BuildHasherDefault<FxHasher>>;
 static FILES: OnceLock<Files> = OnceLock::new();
 
 fn files() -> &'static Files {
-    FILES.get().expect("files are loaded before the server starts")
+    FILES
+        .get()
+        .expect("files are loaded before the server starts")
 }
 
 /// Whether `key` is a folder entry added by `load` rather than a file of its own.
@@ -192,19 +207,28 @@ async fn main() -> std::io::Result<()> {
         eprintln!("bad PORT: {e}");
         process::exit(1);
     });
+    let max_in_memory = env_usize("MAX_IN_MEMORY", DEFAULT_MAX_IN_MEMORY);
+    let max_connections = env_usize("MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS);
+    let nofile = (max_connections as u64).saturating_add(512).max(8192);
 
-    match rlimit::increase_nofile_limit(u64::MAX) {
+    match rlimit::increase_nofile_limit(nofile) {
         Ok(n) => println!("open file limit: {n}"),
         Err(e) => eprintln!("could not raise open file limit: {e}"),
     }
 
-    let loaded = load(Path::new(&site_root));
+    let loaded = load(Path::new(&site_root), max_in_memory);
     if loaded.is_empty() {
         eprintln!("no files found under {site_root}");
         process::exit(1);
     }
     let count = loaded.keys().filter(|k| !is_folder_key(k)).count();
-    println!("loaded {count} files from {site_root}");
+    let mem = loaded
+        .iter()
+        .filter(|(k, f)| !is_folder_key(k) && f.disk_path.is_none())
+        .count();
+    let disk = count - mem;
+    println!("loaded {count} files from {site_root} ({mem} in memory, {disk} served from disk)");
+    println!("max in-memory file: {max_in_memory} bytes, max connections: {max_connections}");
     let _ = FILES.set(loaded);
 
     return_large_blocks_when_freed();
@@ -219,17 +243,21 @@ async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(|| App::new().default_service(web::to(serve)))
         .keep_alive(KeepAlive::Timeout(KEEP_ALIVE))
         .client_request_timeout(REQUEST_HEAD_TIMEOUT)
-        .max_connections(MAX_CONNECTIONS)
+        .client_disconnect_timeout(CLIENT_DISCONNECT_TIMEOUT)
+        .max_connections(max_connections)
         .backlog(BACKLOG)
         .tcp_nodelay(true);
 
-    let host = env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
-        if std::net::TcpListener::bind(("::", 0)).is_ok() {
-            "::".to_owned()
-        } else {
-            "0.0.0.0".to_owned()
-        }
-    });
+    let host = env::var("HOST")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if std::net::TcpListener::bind(("::", 0)).is_ok() {
+                "::".to_owned()
+            } else {
+                "0.0.0.0".to_owned()
+            }
+        });
     let server = server.bind((host.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("listen on :{port}: {e}");
         process::exit(1);
@@ -267,6 +295,10 @@ async fn serve(req: HttpRequest) -> HttpResponse {
         }
         return not_found(files, &req);
     };
+
+    if f.disk_path.is_some() {
+        return serve_disk(f, &req).await;
+    }
 
     let not_modified = ETAGS
         && req
@@ -342,6 +374,95 @@ async fn serve(req: HttpRequest) -> HttpResponse {
     res
 }
 
+async fn serve_disk(f: &File, req: &HttpRequest) -> HttpResponse {
+    let not_modified = ETAGS
+        && req
+            .headers()
+            .get(IF_NONE_MATCH)
+            .is_some_and(|inm| contains(inm.as_bytes(), f.etag.as_bytes()));
+    if not_modified {
+        let mut res = HttpResponse::new(StatusCode::NOT_MODIFIED);
+        let h = res.headers_mut();
+        h.insert(ETAG, f.etag.clone());
+        h.insert(CACHE_CONTROL, f.cc.clone());
+        return res;
+    }
+
+    let mut start = 0usize;
+    let mut end = f.size.saturating_sub(1);
+    let mut code = StatusCode::OK;
+    let mut content_range = None;
+    let range = req
+        .headers()
+        .get(RANGE)
+        .filter(|_| f.ranges && req.method() == Method::GET)
+        .and_then(|v| v.to_str().ok());
+    if let Some(range) = range {
+        let current = req
+            .headers()
+            .get(IF_RANGE)
+            .is_none_or(|ir| ir.is_empty() || (ETAGS && ir.as_bytes() == f.etag.as_bytes()));
+        if current {
+            match parse_range(range, f.size) {
+                ByteRange::Part(s, e) => {
+                    content_range = Some(format!("bytes {s}-{e}/{}", f.size));
+                    start = s;
+                    end = e;
+                    code = StatusCode::PARTIAL_CONTENT;
+                }
+                ByteRange::Unsatisfiable => {
+                    let mut res = status(StatusCode::RANGE_NOT_SATISFIABLE, ERROR_CACHE_CONTROL);
+                    let h = res.headers_mut();
+                    h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", f.size)) {
+                        h.insert(CONTENT_RANGE, v);
+                    }
+                    return res;
+                }
+                ByteRange::Ignore => {}
+            }
+        }
+    }
+
+    let len = if f.size == 0 { 0 } else { end - start + 1 };
+    let path = f.disk_path.as_ref().expect("disk file");
+    let mut res = if req.method() == Method::HEAD || len == 0 {
+        // BodySize::Sized so Content-Length is the file (or range) length, not 0.
+        HttpResponse::build(code).body(EmptySized(len as u64))
+    } else {
+        match open_range(path, start as u64, len as u64).await {
+            Ok(stream) => HttpResponse::build(code).body(stream),
+            Err(_) => return not_found(files(), req),
+        }
+    };
+    let h = res.headers_mut();
+    if f.ranges {
+        h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        h.insert(CONTENT_RANGE, v);
+    }
+    if ETAGS {
+        h.insert(ETAG, f.etag.clone());
+    }
+    h.insert(CACHE_CONTROL, f.cc.clone());
+    security_headers(h);
+    h.insert(CONTENT_TYPE, f.ctype.clone());
+    res
+}
+
+async fn open_range(
+    path: &Path,
+    start: u64,
+    len: u64,
+) -> std::io::Result<SizedStream<ReaderStream<tokio::io::Take<tokio::fs::File>>>> {
+    let mut file = tokio::fs::File::open(path).await?;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+    Ok(SizedStream::new(len, ReaderStream::new(file.take(len))))
+}
+
 fn accept_mask(req: &HttpRequest) -> usize {
     if !COMPRESSION {
         return 0;
@@ -369,7 +490,9 @@ fn accept_mask_of(ae: &str) -> usize {
             let p = p.trim();
             // get() rather than [..2]: a non-ASCII byte must not panic (panic = abort)
             p.get(..2).is_some_and(|k| k.eq_ignore_ascii_case("q="))
-                && p.get(2..).and_then(|v| v.trim().parse::<f32>().ok()).is_some_and(|q| q <= 0.0)
+                && p.get(2..)
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
         });
         let slot = if coding.eq_ignore_ascii_case("br") {
             &mut br
@@ -424,7 +547,8 @@ fn refuse(method: &Method) -> HttpResponse {
             .body("Not Implemented");
     }
     let mut res = status(StatusCode::METHOD_NOT_ALLOWED, ERROR_CACHE_CONTROL);
-    res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+    res.headers_mut()
+        .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
     res
 }
 
@@ -473,6 +597,23 @@ impl MessageBody for Pieces {
         }
         let n = self.0.len().min(BODY_PIECE);
         Poll::Ready(Some(Ok(self.0.split_to(n))))
+    }
+}
+
+struct EmptySized(u64);
+
+impl MessageBody for EmptySized {
+    type Error = Infallible;
+
+    fn size(&self) -> BodySize {
+        BodySize::Sized(self.0)
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Infallible>>> {
+        Poll::Ready(None)
     }
 }
 
@@ -566,12 +707,33 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn fnv1a(data: &[u8]) -> u64 {
-    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    fnv1a_acc(0xcbf2_9ce4_8422_2325, data)
 }
 
-fn load(root: &Path) -> Files {
+fn fnv1a_acc(mut h: u64, data: &[u8]) -> u64 {
+    for b in data {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn hash_file(path: &Path) -> std::io::Result<(u64, usize)> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut size = 0usize;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        size = size.saturating_add(n);
+        h = fnv1a_acc(h, &buf[..n]);
+    }
+    Ok((h, size))
+}
+
+fn load(root: &Path, max_in_memory: usize) -> Files {
     let mut files = Files::default();
     let walker = walkdir::WalkDir::new(root)
         .into_iter()
@@ -581,10 +743,11 @@ fn load(root: &Path) -> Files {
         if !entry.file_type().is_file() {
             continue;
         }
-        let Ok(body) = std::fs::read(entry.path()) else {
+        let path = entry.path();
+        let Ok(meta) = path.metadata() else {
             continue;
         };
-        let Ok(rel) = entry.path().strip_prefix(root) else {
+        let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
         let rel = rel
@@ -592,7 +755,22 @@ fn load(root: &Path) -> Files {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        add(&mut files, rel, body);
+        let source = if meta.len() > max_in_memory as u64 {
+            let Ok((hash, size)) = hash_file(path) else {
+                continue;
+            };
+            FileSource::Disk {
+                path: path.to_path_buf(),
+                size,
+                hash,
+            }
+        } else {
+            let Ok(body) = std::fs::read(path) else {
+                continue;
+            };
+            FileSource::Memory(body)
+        };
+        add(&mut files, rel, source);
     }
     let folders: Vec<(String, Arc<File>)> = files
         .iter()
@@ -605,18 +783,29 @@ fn load(root: &Path) -> Files {
     files
 }
 
-fn add(files: &mut Files, rel: String, body: Vec<u8>) {
+fn add(files: &mut Files, rel: String, source: FileSource) {
     let ctype = content_type(&rel);
-    let base = if rel.starts_with("assets/") { ASSET_CACHE_CONTROL } else { OTHER_CACHE_CONTROL };
+    let base = if rel.starts_with("assets/") {
+        ASSET_CACHE_CONTROL
+    } else {
+        OTHER_CACHE_CONTROL
+    };
     let cc = if NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES && !compressible(&ctype) {
         format!("{base}, no-transform")
     } else {
         base.to_owned()
     };
-    let etag = format!("\"{:016x}\"", fnv1a(&body));
-    let body = Bytes::from_static(Box::leak(body.into_boxed_slice()));
+    let (body, disk_path, size, etag_hash, compress) = match source {
+        FileSource::Memory(buf) => {
+            let hash = fnv1a(&buf);
+            let size = buf.len();
+            (Bytes::from(buf), None, size, hash, true)
+        }
+        FileSource::Disk { path, size, hash } => (Bytes::new(), Some(path), size, hash, false),
+    };
+    let etag = format!("\"{:016x}\"", etag_hash);
 
-    let br = (COMPRESSION && compressible(&ctype))
+    let br = (compress && COMPRESSION && compressible(&ctype))
         .then(|| smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len()))
         .flatten();
     let ranges = br.is_none();
@@ -630,17 +819,15 @@ fn add(files: &mut Files, rel: String, body: Vec<u8>) {
             pick: ArcSwap::from_pointee(pick_table(&body, br)),
             ranges,
             body,
+            disk_path,
+            size,
         }),
     );
 }
 
-/// A header value kept until the server exits, so cloning it never counts references.
+/// Build a header value without leaking it for the process lifetime.
 fn static_value(value: String, fallback: &'static str) -> HeaderValue {
-    if value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b)) {
-        HeaderValue::from_static(Box::leak(value.into_boxed_str()))
-    } else {
-        HeaderValue::from_static(fallback)
-    }
+    HeaderValue::try_from(value).unwrap_or_else(|_| HeaderValue::from_static(fallback))
 }
 
 fn recompress(files: &Files) {
@@ -663,7 +850,7 @@ fn recompress(files: &Files) {
                     // The strongest copy is kept until the server exits, so it is static.
                     let br = brotli_of(&f.body, BROTLI_BEST, brotli_window(f.body.len()))
                         .filter(|c| !c.is_empty() && c.len() < current.body.len())
-                        .map(|c| Bytes::from_static(Box::leak(c.into_boxed_slice())))
+                        .map(Bytes::from)
                         .or_else(|| current.enc.map(|_| current.body.clone()));
                     f.pick.store(Arc::new(pick_table(&f.body, br)));
 
@@ -692,7 +879,9 @@ fn smaller(compressed: Option<Vec<u8>>, than: usize) -> Option<Bytes> {
 }
 
 fn compressed_bytes(table: &PickTable) -> usize {
-    table[ACCEPT_BR].enc.map_or(0, |_| table[ACCEPT_BR].body.len())
+    table[ACCEPT_BR]
+        .enc
+        .map_or(0, |_| table[ACCEPT_BR].body.len())
 }
 
 fn pick_table(body: &Bytes, br: Option<Bytes>) -> PickTable {
@@ -851,4 +1040,14 @@ fn env_str(key: &str, fallback: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn env_usize(key: &str, fallback: usize) -> usize {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| {
+            eprintln!("bad {key}: {e}");
+            process::exit(1);
+        }),
+        _ => fallback,
+    }
 }

@@ -195,6 +195,8 @@ Set these before the command above to change where the server looks and listens 
 | `ROOT` | `/root/www` | The folder your site files are in |
 | `PORT` | `80` | The port the server listens on |
 | `HOST` | every address | The address it listens on. Use `HOST=127.0.0.1` when something on the same machine passes visitors to it, such as a Cloudflare Tunnel (`cloudflared`) or another web server, so the port can't be reached from outside |
+| `MAX_IN_MEMORY` | `2097152` (2 MB) | Files larger than this are served from disk instead of kept (and Brotli-compressed) in RAM. Raise it if you have memory to spare, or lower it on a small VPS |
+| `MAX_CONNECTIONS` | `4096` | Cap on connections accepted at once. Plenty for a site behind Cloudflare on a 2-vCPU VPS; raise it only if you have the RAM |
 
 ---
 
