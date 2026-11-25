@@ -1,0 +1,29 @@
+[package]
+name = "rustwebserver"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rustwebserver"
+path = "main.rs"
+
+[dependencies]
+actix-web = { version = "4.20", default-features = false, features = ["macros"] }
+bytes = "1.12.2"
+arc-swap = "1"
+rlimit = "0.12"
+brotli = "9"
+walkdir = "2.5.1"
+mime_guess = "2"
+percent-encoding = "2"
+libc = "0.2"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
